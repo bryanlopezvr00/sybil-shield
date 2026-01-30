@@ -63,6 +63,9 @@ export type AnalysisSettings = {
   seedActors?: string[];
   seedInfluence: number; // 0..1 additive boost
   seedMaxHops: number; // 0..4
+  trustedActors?: string[];
+  trustInfluence: number; // 0..1 subtractive damping
+  trustMaxHops: number; // 0..4
 };
 
 export type ActorScorecard = {
@@ -106,6 +109,7 @@ export type ActorScorecard = {
   maxTargetJaccard: number;
   topTargetJaccardActor: string;
   seedProximityScore: number;
+  trustProximityScore: number;
   sharedWallets: string[];
   crossAppPlatforms: string[];
   sessionCount: number;
@@ -526,6 +530,36 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     }
   }
 
+  // Trusted propagation: dampen suspicion near known-good identities (reduces false positives)
+  const trustInfluence = Math.max(0, Math.min(settings.trustInfluence ?? 0, 1));
+  const trustMaxHops = Math.min(Math.max(settings.trustMaxHops ?? 0, 0), 4);
+  const trustProximity = new Map<string, number>();
+  const trusted = Array.from(new Set((settings.trustedActors || []).map((x) => String(x))));
+  if (trusted.length > 0 && trustInfluence > 0 && trustMaxHops > 0) {
+    const queue: Array<{ node: string; hop: number }> = [];
+    const seenHop = new Map<string, number>();
+    for (const t of trusted) {
+      if (!nodes.has(t)) continue;
+      queue.push({ node: t, hop: 0 });
+      seenHop.set(t, 0);
+      trustProximity.set(t, 1);
+    }
+    while (queue.length) {
+      const { node, hop } = queue.shift()!;
+      if (hop >= trustMaxHops) continue;
+      const neighbors = graph[node] || [];
+      for (const nb of neighbors) {
+        const nextHop = hop + 1;
+        const prevHop = seenHop.get(nb);
+        if (prevHop !== undefined && prevHop <= nextHop) continue;
+        seenHop.set(nb, nextHop);
+        const proximity = Math.max(0, 1 - nextHop / (trustMaxHops + 0.0001));
+        trustProximity.set(nb, Math.max(trustProximity.get(nb) || 0, proximity));
+        queue.push({ node: nb, hop: nextHop });
+      }
+    }
+  }
+
   // Controller / entity resolution (multi-account linking)
   const bioByActor = new Map<string, string>();
   const handleStemByActor = new Map<string, string>();
@@ -623,14 +657,17 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
 
     const jacc = maxJaccardByActor.get(stats.actor) ?? { score: 0, peer: '' };
     const seedProximityScore = seedProximity.get(stats.actor) ?? 0;
+    const trustProximityScore = trustProximity.get(stats.actor) ?? 0;
 
     // Extra mini-app style risk boosters (kept additive + clamped for backwards compatibility)
     const sharedWalletScore = (sharedFundersByWallet.get(stats.actor)?.length ?? 0) > 0 ? 1 : 0;
     const crossAppScore = (crossAppLinks.get(stats.actor)?.length ?? 0) > 1 ? 0.5 : 0;
     const sessionScore = session.bottySessionScore;
     const fraudScore = fraudulentTx.get(stats.actor) ?? 0;
-    const sybilScore = Math.min(
-      baseSybilScore +
+    const sybilScore = Math.max(
+      0,
+      Math.min(
+        baseSybilScore +
         0.10 * rapidActionScore +
         0.05 * (stats.totalActions >= settings.entropyMinTotalActions ? lowEntropyScore : 0) +
         0.05 * velocity.velocityScore +
@@ -641,8 +678,10 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
         0.05 * sharedWalletScore +
         0.05 * crossAppScore +
         0.05 * sessionScore +
-        0.05 * fraudScore,
-      1,
+        0.05 * fraudScore -
+        trustInfluence * trustProximityScore,
+        1,
+      ),
     );
 
     const reasons: string[] = [];
@@ -665,6 +704,7 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     if (circadian.circadianScore >= 0.8) reasons.push(`Unnatural circadian pattern (active hours ${circadian.activeHours})`);
     if (jacc.score >= 0.85 && stats.uniqueTargets.size >= 3 && jacc.peer) reasons.push(`Very similar targets to ${jacc.peer} (Jaccard ${jacc.score.toFixed(2)})`);
     if (seedInfluence > 0 && seedProximityScore >= 0.5) reasons.push(`Near confirmed sybil(s) (seed proximity ${seedProximityScore.toFixed(2)})`);
+    if (trustInfluence > 0 && trustProximityScore >= 0.7) reasons.push(`Near trusted actor(s) (trust proximity ${trustProximityScore.toFixed(2)})`);
     if (stats.totalActions >= settings.entropyMinTotalActions && lowEntropyScore >= 0.7) reasons.push(`Low target entropy (${ent.toFixed(2)})`);
     if (sharedFundersByWallet.get(stats.actor)?.length) reasons.push(`Shared funders (${sharedFundersByWallet.get(stats.actor)!.length})`);
     if (crossAppLinks.get(stats.actor)?.length) reasons.push(`Cross-app activity (${crossAppLinks.get(stats.actor)!.join(', ')})`);
@@ -712,6 +752,7 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       maxTargetJaccard: jacc.score,
       topTargetJaccardActor: jacc.peer,
       seedProximityScore,
+      trustProximityScore,
       sharedWallets: sharedFundersByWallet.get(stats.actor) ?? [],
       crossAppPlatforms: crossAppLinks.get(stats.actor) ?? [],
       sessionCount: session.sessionCount,

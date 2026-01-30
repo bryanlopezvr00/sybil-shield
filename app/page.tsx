@@ -48,6 +48,8 @@ export default function Home() {
     actionNgramSize: 3,
     seedInfluence: 0.15,
     seedMaxHops: 2,
+    trustInfluence: 0.15,
+    trustMaxHops: 2,
   });
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [fileUploaded, setFileUploaded] = useState(false);
@@ -105,6 +107,7 @@ export default function Home() {
   const [reviews, setReviews] = useState<Record<string, { decision: ReviewDecision | ''; note?: string; updatedAt: string }>>({});
   const [reviewsLoading, setReviewsLoading] = useState(true);
   const [useReviewSeeds, setUseReviewSeeds] = useState(true);
+  const [useDismissAsTrustedSeeds, setUseDismissAsTrustedSeeds] = useState(true);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; pct: number } | null>(null);
   const [analysisRequestId, setAnalysisRequestId] = useState<string | null>(null);
@@ -755,7 +758,12 @@ export default function Home() {
           .filter(([, r]) => r.decision === 'confirm_sybil')
           .map(([actor]) => actor)
       : [];
-    const settingsToSend: AnalysisSettings = { ...settings, seedActors };
+    const trustedActors = useDismissAsTrustedSeeds
+      ? Object.entries(reviews)
+          .filter(([, r]) => r.decision === 'dismiss')
+          .map(([actor]) => actor)
+      : [];
+    const settingsToSend: AnalysisSettings = { ...settings, seedActors, trustedActors };
 
     void addAuditEvent({
       type: 'analysis_run',
@@ -1876,6 +1884,8 @@ export default function Home() {
 	                      actionNgramSize: 3,
 	                      seedInfluence: 0.15,
 	                      seedMaxHops: 2,
+	                      trustInfluence: 0.15,
+	                      trustMaxHops: 2,
 	                      positiveActions: Array.from(
 	                        new Set([
 	                          ...s.positiveActions,
@@ -2105,6 +2115,42 @@ export default function Home() {
                           </label>
                           <div className="text-xs text-slate-500">
                             Tip: mark a few accounts as <code>confirm_sybil</code>, rerun analysis, and we’ll boost nearby accounts in the interaction graph.
+                          </div>
+                        </div>
+                      </div>
+                      <div className="md:col-span-2 border-t border-slate-800 pt-3">
+                        <div className="text-sm text-slate-200 font-medium">Trusted damping (reduce false positives)</div>
+                        <div className="mt-2 flex flex-wrap items-center gap-3">
+                          <label className="text-xs text-slate-300 flex items-center gap-2">
+                            <input type="checkbox" checked={useDismissAsTrustedSeeds} onChange={(e) => setUseDismissAsTrustedSeeds(e.target.checked)} />
+                            Use <code>dismiss</code> as trusted seeds
+                          </label>
+                          <label className="text-xs text-slate-300 flex items-center gap-2">
+                            Influence
+                            <input
+                              type="number"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={settings.trustInfluence}
+                              onChange={(e) => setSettings((s) => ({ ...s, trustInfluence: Math.max(0, Math.min(1, Number.parseFloat(e.target.value || '0') || 0)) }))}
+                              className="w-20 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-xs text-slate-100"
+                            />
+                          </label>
+                          <label className="text-xs text-slate-300 flex items-center gap-2">
+                            Max hops
+                            <input
+                              type="number"
+                              min={0}
+                              max={4}
+                              step={1}
+                              value={settings.trustMaxHops}
+                              onChange={(e) => setSettings((s) => ({ ...s, trustMaxHops: Math.max(0, Math.min(4, Number.parseInt(e.target.value || '0', 10) || 0)) }))}
+                              className="w-16 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-xs text-slate-100"
+                            />
+                          </label>
+                          <div className="text-xs text-slate-500">
+                            Tip: if you know some accounts are legitimate, mark them <code>dismiss</code> and rerun analysis to dampen nearby accounts.
                           </div>
                         </div>
                       </div>
@@ -2423,6 +2469,9 @@ export default function Home() {
 	                        </div>
 	                        <div>
 	                          Linking: ctrl {s.controllerId ?? '-'} · jacc {s.maxTargetJaccard.toFixed(2)}{s.topTargetJaccardActor ? ` (${s.topTargetJaccardActor})` : ''} · seed {s.seedProximityScore.toFixed(2)}
+	                        </div>
+	                        <div>
+	                          Trust: proximity {s.trustProximityScore.toFixed(2)}
 	                        </div>
 	                        <div>
 	                          Profile/graph: links {s.links.length} · bio {s.bioSimilarityScore.toFixed(2)} · handle {s.handlePatternScore.toFixed(2)} · phish {s.phishingLinkScore.toFixed(2)} · PR {s.pagerank.toFixed(4)} · betw {s.betweenness.toFixed(2)}
