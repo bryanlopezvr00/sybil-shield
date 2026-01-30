@@ -4,7 +4,7 @@ A Next.js web application for detecting Sybil attacks in social and onchain plat
 
 ## Overview
 
-This app focuses on graph-based and behavioral signal analysis to identify Sybil clusters. It supports data from GitHub (followers/stars), Farcaster/Base (onchain transactions, follows/casts), and Binance/Web3 (wallet clusters, trade patterns). The app visualizes interaction graphs, detects coordinated timing, behavioral anomalies, and churn signals to flag potential Sybil farms.
+This app focuses on graph-based and behavioral signal analysis to identify Sybil clusters. It supports data from GitHub (followers/stars), Farcaster/Base (onchain transactions, follows/casts), Talent Protocol, and Binance/Web3 (wallet clusters, trade patterns). The app visualizes interaction graphs, detects coordinated timing, behavioral anomalies, and churn signals to flag potential Sybil farms.
 
 ## Use Cases
 
@@ -99,6 +99,7 @@ ML is treated as an augmentation layer, not the primary decision-maker.
 
 - GitHub: Followers list, stargazers per repo (via API or exports).
 - Farcaster/Base: Onchain txns (Base explorer), follows/casts (Farcaster hubs).
+- Talent Protocol: Talent scores, endorsements, and builder interactions.
 - Binance/Web3: Wallet clusters, trade patterns.
 - Logs: Timestamps of actions, regional/IP hints.
 
@@ -136,7 +137,7 @@ Expand with ML: Centrality measures, DBSCAN on features.
 
 - `timestamp` (ISO8601 string, e.g., `2023-01-01T10:00:00Z`)
 - `platform` (string: `github`, `farcaster`, `base`, `binance`, or custom)
-- `action` (string: `follow`, `unfollow`, `star`, `unstar`, `transfer`, `swap`, `comment`, `fork`, `pr`, `issue`)
+- `action` (string: `follow`, `unfollow`, `star`, `unstar`, `transfer`, `swap`, `comment`, `fork`, `pr`, `issue`, `endorse`, `score`)
 - `actor` (string: user handle or wallet address)
 - `target` (string: user/repo/wallet/contract)
 
@@ -162,7 +163,8 @@ timestamp,platform,action,actor,target,amount,meta
 2023-01-01T10:00:00Z,github,follow,user1,user2,,{"repo": "example/repo"}
 2023-01-01T10:01:00Z,github,star,user2,example/repo,,
 2023-01-01T10:02:00Z,base,transfer,0x123...,0x456...,1000,{"chainId": 8453, "token": "ETH"}
-2023-01-01T10:03:00Z,farcaster,follow,user3,user4,,
+2023-01-01T10:03:00Z,talent,endorse,user3,user4,,{"score": 85}
+2023-01-01T10:04:00Z,farcaster,follow,user5,user6,,
 ```
 
 ### Example JSON Array
@@ -183,6 +185,14 @@ timestamp,platform,action,actor,target,amount,meta
     "action": "star",
     "actor": "user2",
     "target": "example/repo"
+  },
+  {
+    "timestamp": "2023-01-01T10:02:00Z",
+    "platform": "talent",
+    "action": "endorse",
+    "actor": "user3",
+    "target": "user4",
+    "meta": "{\"score\": 85}"
   }
 ]
 ```
@@ -367,6 +377,7 @@ Planned concrete endpoints for real data:
 
 - **GitHub**: REST API (stargazers, followers, events, user profiles for age/bio/follower counts). Rate limit handling. Optional GitHub App for private repos.
 - **Base/Onchain**: RPC via Alchemy/QuickNode. Transfer graphs from ERC20 events. Funding-tree detection ("common funder" chains). Wallet profiles via ENS or onchain data.
+- **Talent Protocol**: API for talent scores, endorsements, and builder networks. Sybil detection for decentralized talent verification.
 - **Farcaster**: Hub API or Neynar. Follow/cast graphs. User profiles (bio, followers, created_at).
 
 ## Deployment & Storage
