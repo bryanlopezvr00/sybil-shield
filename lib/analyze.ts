@@ -47,6 +47,8 @@ export type AnalysisSettings = {
   waveMinActors: number;
   positiveActions: string[];
   churnActions: string[];
+  rapidActionsPerMinuteThreshold: number;
+  entropyMinTotalActions: number;
 };
 
 export type ActorScorecard = {
@@ -68,6 +70,17 @@ export type ActorScorecard = {
   bioSimilarityScore: number;
   handlePatternScore: number;
   phishingLinkScore: number;
+  pagerank: number;
+  eigenCentrality: number;
+  betweenness: number;
+  maxActionsPerMinute: number;
+  rapidActionScore: number;
+  targetEntropy: number; // normalized [0,1]
+  lowEntropyScore: number; // 1 - targetEntropy
+  sharedWallets: string[];
+  crossAppPlatforms: string[];
+  sessionCount: number;
+  fraudTxScore: number;
   reasons: string[];
 };
 
@@ -152,6 +165,30 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   const nodeElements: NodeDefinition[] = Array.from(nodes).map((id) => ({ data: { id, label: id } }));
   const elements: ElementDefinition[] = [...nodeElements, ...edges];
   report({ stage: 'graph', pct: 30 });
+
+  // Centrality measures (computed on the positive-action graph)
+  const outNeighbors = new Map<string, string[]>();
+  const inNeighbors = new Map<string, string[]>();
+  const undirected = new Map<string, Set<string>>();
+  nodes.forEach((n) => {
+    outNeighbors.set(n, []);
+    inNeighbors.set(n, []);
+    undirected.set(n, new Set());
+  });
+  edges.forEach((e) => {
+    const s = e.data?.source as string;
+    const t = e.data?.target as string;
+    if (!s || !t) return;
+    outNeighbors.get(s)?.push(t);
+    inNeighbors.get(t)?.push(s);
+    undirected.get(s)?.add(t);
+    undirected.get(t)?.add(s);
+  });
+
+  const pagerank = computePageRank(Array.from(nodes), outNeighbors, inNeighbors);
+  const eigenCentrality = computeEigenCentrality(Array.from(nodes), undirected);
+  const betweenness = computeApproxBetweenness(Array.from(nodes), undirected);
+  report({ stage: 'clusters', pct: 38 });
 
   // Build adjacency for undirected connected components
   const graph: Record<string, string[]> = {};
@@ -286,6 +323,49 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     });
   });
 
+  // Mini-app style signals: rapid actions/minute and target entropy
+  const perActorMinuteCounts = new Map<string, Map<number, number>>();
+  logs.forEach((log) => {
+    const t = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(t)) return;
+    const minute = Math.floor(t / 60000);
+    if (!perActorMinuteCounts.has(log.actor)) perActorMinuteCounts.set(log.actor, new Map());
+    const m = perActorMinuteCounts.get(log.actor)!;
+    m.set(minute, (m.get(minute) || 0) + 1);
+  });
+
+  const maxActionsPerMinute = new Map<string, number>();
+  perActorMinuteCounts.forEach((m, actor) => {
+    let max = 0;
+    m.forEach((c) => {
+      if (c > max) max = c;
+    });
+    maxActionsPerMinute.set(actor, max);
+  });
+
+  const targetEntropy = new Map<string, number>();
+  Object.values(actorStats).forEach((s) => {
+    const k = s.uniqueTargets.size;
+    if (s.totalActions <= 0 || k <= 1) {
+      targetEntropy.set(s.actor, 0);
+      return;
+    }
+    // Recompute per-actor target counts from logs (streaming would be better, but OK for now)
+    const counts = new Map<string, number>();
+    logs.forEach((log) => {
+      if (log.actor !== s.actor) return;
+      counts.set(log.target, (counts.get(log.target) || 0) + 1);
+    });
+    const total = s.totalActions;
+    let H = 0;
+    counts.forEach((c) => {
+      const p = c / total;
+      H += -p * Math.log(p);
+    });
+    const Hmax = Math.log(k) || 1;
+    targetEntropy.set(s.actor, Math.max(0, Math.min(H / Hmax, 1)));
+  });
+
   // reciprocity
   nodes.forEach((actor) => {
     const outSet = positiveOut.get(actor) ?? new Set<string>();
@@ -318,6 +398,12 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
 
   const handlePatterns = computeHandlePatternScores(Array.from(nodes));
 
+  // Additional mini-app detections
+  const sharedWallets = detectSharedWallets(logs);
+  const crossAppLinks = detectCrossAppLinking(logs);
+  const sessionAnomalies = detectSessionAnomalies(logs);
+  const fraudulentTx = detectFraudulentTransactions(logs);
+
   const scorecards: ActorScorecard[] = Object.values(actorStats).map((stats) => {
     const coordinationScore = stats.totalActions > 0 ? Math.min(stats.burstActions / stats.totalActions, 1) : 0;
     const churnScore = stats.churnActions;
@@ -343,13 +429,29 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     const phishingLinkScore = phishingLinks.length > 0 ? Math.min(phishingLinks.length / 2, 1) : 0;
     const profileAnomalyScore = updateProfileAnomalyScore(stats.actor, links, profile.followerCount, profile.followingCount);
 
-    const sybilScore =
+    const baseSybilScore =
       0.30 * coordinationScore +
       0.20 * Math.min(churnScore / 10, 1) +
       0.15 * clusterIsolationScore +
       0.10 * newAccountScore +
       0.10 * lowDiversityScore +
       0.15 * profileAnomalyScore;
+
+    const maxApm = maxActionsPerMinute.get(stats.actor) || 0;
+    const rapidActionScore =
+      maxApm >= Math.max(1, settings.rapidActionsPerMinuteThreshold)
+        ? Math.min((maxApm - settings.rapidActionsPerMinuteThreshold) / settings.rapidActionsPerMinuteThreshold, 1)
+        : 0;
+
+    const ent = targetEntropy.get(stats.actor) ?? 0;
+    const lowEntropyScore = 1 - ent;
+
+    // Extra mini-app style risk boosters (kept additive + clamped for backwards compatibility)
+    const sharedWalletScore = (sharedWallets.get(stats.actor)?.length ?? 0) > 0 ? 1 : 0;
+    const crossAppScore = (crossAppLinks.get(stats.actor)?.length ?? 0) > 1 ? 0.5 : 0;
+    const sessionScore = Math.min((sessionAnomalies.get(stats.actor) ?? 0) / 10, 1);
+    const fraudScore = fraudulentTx.get(stats.actor) ?? 0;
+    const sybilScore = Math.min(baseSybilScore + 0.10 * rapidActionScore + 0.05 * (stats.totalActions >= settings.entropyMinTotalActions ? lowEntropyScore : 0) + 0.05 * sharedWalletScore + 0.05 * crossAppScore + 0.05 * sessionScore + 0.05 * fraudScore, 1);
 
     const reasons: string[] = [];
     if (sybilScore > settings.threshold) reasons.push(`Score ${sybilScore.toFixed(2)} ≥ threshold ${settings.threshold.toFixed(2)}`);
@@ -363,6 +465,14 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     if (bioSimilarityScore >= 0.4) reasons.push(`Repeated bio text (${bioSimilarityScore.toFixed(2)})`);
     if (handlePatternScore >= 0.4) reasons.push(`Handle pattern similarity (${handlePatternScore.toFixed(2)})`);
     if (newAccountScore === 1) reasons.push('New account (<7 days)');
+    if ((pagerank.get(stats.actor) || 0) > 0.01) reasons.push(`High PageRank (${(pagerank.get(stats.actor) || 0).toFixed(3)})`);
+    if ((betweenness.get(stats.actor) || 0) > 0.05) reasons.push(`Bridge-like betweenness (${(betweenness.get(stats.actor) || 0).toFixed(2)})`);
+    if (maxApm >= settings.rapidActionsPerMinuteThreshold) reasons.push(`Rapid actions (${maxApm}/min)`);
+    if (stats.totalActions >= settings.entropyMinTotalActions && lowEntropyScore >= 0.7) reasons.push(`Low target entropy (${ent.toFixed(2)})`);
+    if (sharedWallets.get(stats.actor)?.length) reasons.push(`Shared wallets (${sharedWallets.get(stats.actor)!.length})`);
+    if (crossAppLinks.get(stats.actor)?.length) reasons.push(`Cross-app activity (${crossAppLinks.get(stats.actor)!.join(', ')})`);
+    if ((sessionAnomalies.get(stats.actor) ?? 0) > 5) reasons.push(`High session count (${sessionAnomalies.get(stats.actor)})`);
+    if ((fraudulentTx.get(stats.actor) ?? 0) > 0.5) reasons.push(`Fraudulent transaction patterns (${(fraudulentTx.get(stats.actor) ?? 0).toFixed(2)})`);
 
     return {
       actor: stats.actor,
@@ -383,6 +493,17 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       bioSimilarityScore,
       handlePatternScore,
       phishingLinkScore,
+      pagerank: pagerank.get(stats.actor) || 0,
+      eigenCentrality: eigenCentrality.get(stats.actor) || 0,
+      betweenness: betweenness.get(stats.actor) || 0,
+      maxActionsPerMinute: maxApm,
+      rapidActionScore,
+      targetEntropy: ent,
+      lowEntropyScore,
+      sharedWallets: sharedWallets.get(stats.actor) ?? [],
+      crossAppPlatforms: crossAppLinks.get(stats.actor) ?? [],
+      sessionCount: sessionAnomalies.get(stats.actor) ?? 0,
+      fraudTxScore: fraudulentTx.get(stats.actor) ?? 0,
       reasons,
     };
   });
@@ -392,3 +513,213 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   return { elements, clusters, waves, scorecards };
 }
 
+export function detectSharedWallets(logs: LogEntry[]): Map<string, string[]> {
+  const walletToActors = new Map<string, Set<string>>();
+  logs.forEach(log => {
+    if (log.meta && typeof log.meta === 'string' && log.meta.startsWith('0x')) { // assume wallet address
+      if (!walletToActors.has(log.meta)) walletToActors.set(log.meta, new Set());
+      walletToActors.get(log.meta)!.add(log.actor);
+    }
+  });
+  const actorToSharedWallets = new Map<string, string[]>();
+  walletToActors.forEach((actors, wallet) => {
+    if (actors.size > 1) {
+      actors.forEach(actor => {
+        if (!actorToSharedWallets.has(actor)) actorToSharedWallets.set(actor, []);
+        actorToSharedWallets.get(actor)!.push(wallet);
+      });
+    }
+  });
+  return actorToSharedWallets;
+}
+
+export function detectCrossAppLinking(logs: LogEntry[]): Map<string, string[]> {
+  const actorToPlatforms = new Map<string, Set<string>>();
+  logs.forEach(log => {
+    if (!actorToPlatforms.has(log.actor)) actorToPlatforms.set(log.actor, new Set());
+    actorToPlatforms.get(log.actor)!.add(log.platform);
+  });
+  const crossAppActors = new Map<string, string[]>();
+  actorToPlatforms.forEach((platforms, actor) => {
+    if (platforms.size > 1) {
+      crossAppActors.set(actor, Array.from(platforms));
+    }
+  });
+  return crossAppActors;
+}
+
+export function detectSessionAnomalies(logs: LogEntry[], sessionThresholdMs: number = 300000): Map<string, number> {
+  const actorSessions = new Map<string, number[]>();
+  logs.forEach(log => {
+    const ts = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(ts)) return;
+    if (!actorSessions.has(log.actor)) actorSessions.set(log.actor, []);
+    actorSessions.get(log.actor)!.push(ts);
+  });
+  const sessionScores = new Map<string, number>();
+  actorSessions.forEach((times, actor) => {
+    times.sort((a, b) => a - b);
+    let sessions = 0;
+    let currentSessionStart = times[0];
+    for (let i = 1; i < times.length; i++) {
+      if (times[i] - times[i - 1] > sessionThresholdMs) {
+        sessions++;
+        currentSessionStart = times[i];
+      }
+    }
+    sessions++; // last session
+    sessionScores.set(actor, sessions);
+  });
+  return sessionScores;
+}
+
+export function detectFraudulentTransactions(logs: LogEntry[]): Map<string, number> {
+  const actorAmounts = new Map<string, number[]>();
+  logs.forEach(log => {
+    if (log.amount !== undefined) {
+      if (!actorAmounts.has(log.actor)) actorAmounts.set(log.actor, []);
+      actorAmounts.get(log.actor)!.push(log.amount);
+    }
+  });
+  const fraudScores = new Map<string, number>();
+  actorAmounts.forEach((amounts, actor) => {
+    if (amounts.length < 2) return;
+    const avg = amounts.reduce((a, b) => a + b, 0) / amounts.length;
+    const variance = amounts.reduce((sum, a) => sum + (a - avg) ** 2, 0) / amounts.length;
+    const std = Math.sqrt(variance);
+    const score = std / (avg + 1); // normalized high variance
+    fraudScores.set(actor, Math.min(score, 1));
+  });
+  return fraudScores;
+}
+
+function computePageRank(nodes: string[], out: Map<string, string[]>, incoming: Map<string, string[]>): Map<string, number> {
+  const N = Math.max(nodes.length, 1);
+  const damping = 0.85;
+  let rank = new Map<string, number>();
+  nodes.forEach((n) => rank.set(n, 1 / N));
+
+  for (let iter = 0; iter < 20; iter++) {
+    const next = new Map<string, number>();
+    let danglingSum = 0;
+    for (const n of nodes) {
+      const outDeg = out.get(n)?.length ?? 0;
+      if (outDeg === 0) danglingSum += rank.get(n) || 0;
+    }
+    const base = (1 - damping) / N;
+    const danglingShare = damping * danglingSum / N;
+
+    for (const n of nodes) {
+      let sum = 0;
+      const inc = incoming.get(n) ?? [];
+      for (const src of inc) {
+        const outDeg = out.get(src)?.length ?? 0;
+        if (outDeg > 0) sum += (rank.get(src) || 0) / outDeg;
+      }
+      next.set(n, base + danglingShare + damping * sum);
+    }
+    rank = next;
+  }
+  return rank;
+}
+
+function computeEigenCentrality(nodes: string[], undirected: Map<string, Set<string>>): Map<string, number> {
+  const v = new Map<string, number>();
+  nodes.forEach((n) => v.set(n, 1));
+
+  for (let iter = 0; iter < 20; iter++) {
+    const next = new Map<string, number>();
+    let norm = 0;
+    for (const n of nodes) {
+      let sum = 0;
+      for (const nb of undirected.get(n) ?? []) sum += v.get(nb) || 0;
+      next.set(n, sum);
+      norm += sum * sum;
+    }
+    norm = Math.sqrt(norm) || 1;
+    for (const n of nodes) next.set(n, (next.get(n) || 0) / norm);
+    for (const n of nodes) v.set(n, next.get(n) || 0);
+  }
+  return v;
+}
+
+function computeApproxBetweenness(nodes: string[], undirected: Map<string, Set<string>>): Map<string, number> {
+  const n = nodes.length;
+  const out = new Map<string, number>();
+  nodes.forEach((node) => out.set(node, 0));
+  if (n <= 2) return out;
+
+  // Sample sources to keep runtime reasonable on big graphs.
+  const sampleSize = Math.min(50, n);
+  const sampled = sampleDeterministic(nodes, sampleSize);
+
+  for (const s of sampled) {
+    const stack: string[] = [];
+    const pred = new Map<string, string[]>();
+    const sigma = new Map<string, number>();
+    const dist = new Map<string, number>();
+
+    nodes.forEach((v) => {
+      pred.set(v, []);
+      sigma.set(v, 0);
+      dist.set(v, -1);
+    });
+    sigma.set(s, 1);
+    dist.set(s, 0);
+
+    const queue: string[] = [s];
+    while (queue.length > 0) {
+      const v = queue.shift()!;
+      stack.push(v);
+      const dv = dist.get(v) || 0;
+      for (const w of undirected.get(v) ?? []) {
+        if ((dist.get(w) ?? -1) < 0) {
+          queue.push(w);
+          dist.set(w, dv + 1);
+        }
+        if (dist.get(w) === dv + 1) {
+          sigma.set(w, (sigma.get(w) || 0) + (sigma.get(v) || 0));
+          pred.get(w)!.push(v);
+        }
+      }
+    }
+
+    const delta = new Map<string, number>();
+    nodes.forEach((v) => delta.set(v, 0));
+    while (stack.length > 0) {
+      const w = stack.pop()!;
+      for (const v of pred.get(w) ?? []) {
+        const c = ((sigma.get(v) || 0) / (sigma.get(w) || 1)) * (1 + (delta.get(w) || 0));
+        delta.set(v, (delta.get(v) || 0) + c);
+      }
+      if (w !== s) out.set(w, (out.get(w) || 0) + (delta.get(w) || 0));
+    }
+  }
+
+  // Normalize to [0,1] approximately
+  const scale = sampled.length > 0 ? 1 / sampled.length : 1;
+  let max = 0;
+  nodes.forEach((v) => {
+    const val = (out.get(v) || 0) * scale;
+    out.set(v, val);
+    max = Math.max(max, val);
+  });
+  if (max > 0) nodes.forEach((v) => out.set(v, (out.get(v) || 0) / max));
+  return out;
+}
+
+function sampleDeterministic(nodes: string[], k: number): string[] {
+  // Deterministic pseudo-random sample based on a simple hash of node ids.
+  const scored = nodes.map((n) => ({ n, h: fnv1a32(n) }));
+  scored.sort((a, b) => a.h - b.h);
+  return scored.slice(0, k).map((x) => x.n);
+}
+
+function fnv1a32(str: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}

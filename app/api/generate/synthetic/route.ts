@@ -69,10 +69,12 @@ function makeHandle(prefix: string, index: number, rng: () => number): string {
 
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as SyntheticRequest;
-  const seed = Number.isFinite(body.seed) ? (body.seed as number) : Date.now();
+  const rawSeed = Number.isFinite(body.seed) ? (body.seed as number) : Date.now();
+  const seed = clampInt(rawSeed, 0, 999_999);
   const rng = mulberry32(seed);
 
-  const startMs = body.startTime ? new Date(body.startTime).getTime() : Date.now() - 60 * 60 * 1000;
+  const parsedStartMs = body.startTime ? new Date(body.startTime).getTime() : NaN;
+  const startMs = Number.isFinite(parsedStartMs) ? parsedStartMs : Date.now() - 60 * 60 * 1000;
   const minutes = clampInt(body.minutes ?? 120, 5, 24 * 60);
   const endMs = startMs + minutes * 60 * 1000;
 
@@ -244,4 +246,3 @@ export async function POST(req: Request) {
     logs,
   });
 }
-

@@ -18,7 +18,7 @@ const CytoscapeComponent = dynamic(() => import('react-cytoscapejs'), { ssr: fal
 
 type CsvRow = Record<string, string | undefined>;
 
-type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'assistant' | 'graph' | 'results' | 'review' | 'evidence';
+type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'assistant' | 'graph' | 'results' | 'review' | 'evidence' | 'miniapp';
 
 export default function Home() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
@@ -35,6 +35,8 @@ export default function Home() {
     waveMinActors: 8,
     positiveActions: ['follow', 'star', 'transfer', 'fork'],
     churnActions: ['unfollow', 'unstar'],
+    rapidActionsPerMinuteThreshold: 50,
+    entropyMinTotalActions: 20,
   });
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [fileUploaded, setFileUploaded] = useState(false);
@@ -46,6 +48,7 @@ export default function Home() {
   const [importUrlsText, setImportUrlsText] = useState('');
   const [farcasterId, setFarcasterId] = useState('');
   const [baseAddress, setBaseAddress] = useState('');
+  const [baseRpcUrl, setBaseRpcUrl] = useState('');
   const [talentId, setTalentId] = useState('');
   const [profileLinksText, setProfileLinksText] = useState('');
   const [scanFoundLinks, setScanFoundLinks] = useState<string[]>([]);
@@ -89,6 +92,7 @@ export default function Home() {
   const [syntheticLastLogs, setSyntheticLastLogs] = useState<LogEntry[] | null>(null);
 
   const [reviews, setReviews] = useState<Record<string, { decision: ReviewDecision | ''; note?: string; updatedAt: string }>>({});
+  const [reviewsLoading, setReviewsLoading] = useState(true);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; pct: number } | null>(null);
   const [analysisRequestId, setAnalysisRequestId] = useState<string | null>(null);
@@ -107,10 +111,19 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const saved = window.localStorage.getItem('sybilShieldBaseRpcUrl');
+    if (typeof saved === 'string' && saved.trim()) setBaseRpcUrl(saved);
+  }, []);
+
+  useEffect(() => {
     const root = document.documentElement;
     root.dataset.theme = theme;
     window.localStorage.setItem('sybilShieldTheme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem('sybilShieldBaseRpcUrl', baseRpcUrl.trim());
+  }, [baseRpcUrl]);
 
   const TabButton = ({ tab, label }: { tab: TabKey; label: string }) => (
     <button
@@ -218,6 +231,26 @@ export default function Home() {
       topSharedLinks: top(sharedLinkCounts, 8),
       topHandleStems: topMap(handlePatterns.stemCounts, 8),
       topHandleShapes: topMap(handlePatterns.shapeCounts, 6),
+      topPageRank: scorecards
+        .slice()
+        .sort((a, b) => (b.pagerank || 0) - (a.pagerank || 0))
+        .slice(0, 8)
+        .map((s) => ({ key: s.actor, count: Number((s.pagerank || 0).toFixed(6)) })),
+      topBetweenness: scorecards
+        .slice()
+        .sort((a, b) => (b.betweenness || 0) - (a.betweenness || 0))
+        .slice(0, 8)
+        .map((s) => ({ key: s.actor, count: Number((s.betweenness || 0).toFixed(4)) })),
+      topEigen: scorecards
+        .slice()
+        .sort((a, b) => (b.eigenCentrality || 0) - (a.eigenCentrality || 0))
+        .slice(0, 8)
+        .map((s) => ({ key: s.actor, count: Number((s.eigenCentrality || 0).toFixed(4)) })),
+      topRapidActors: scorecards
+        .slice()
+        .sort((a, b) => (b.maxActionsPerMinute || 0) - (a.maxActionsPerMinute || 0))
+        .slice(0, 8)
+        .map((s) => ({ key: s.actor, count: s.maxActionsPerMinute || 0 })),
       topWaves: waves
         .slice()
         .sort((a, b) => b.actors.length - a.actors.length)
@@ -229,6 +262,7 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
+    setReviewsLoading(true);
     getAllReviews()
       .then((all) => {
         if (cancelled) return;
@@ -237,9 +271,10 @@ export default function Home() {
           map[r.actor] = { decision: r.decision, note: r.note, updatedAt: r.updatedAt };
         });
         setReviews(map);
+        setReviewsLoading(false);
       })
       .catch(() => {
-        // ignore
+        setReviewsLoading(false);
       });
     return () => {
       cancelled = true;
@@ -250,6 +285,10 @@ export default function Home() {
     const worker = new Worker(new URL('./workers/analyzeWorker.ts', import.meta.url), { type: 'module' });
     setAnalysisWorker(worker);
     return () => {
+      if (analysisListenerRef.current) {
+        worker.removeEventListener('message', analysisListenerRef.current);
+        analysisListenerRef.current = null;
+      }
       worker.terminate();
       setAnalysisWorker(null);
     };
@@ -319,6 +358,25 @@ export default function Home() {
     settings.waveMinCount,
     waves.length,
   ]);
+
+  const syntheticMetrics = useMemo(() => {
+    if (!syntheticGroundTruth || syntheticGroundTruth.sybilActors.length === 0) return null;
+    const truth = new Set(syntheticGroundTruth.sybilActors);
+    const flagged = new Set(flaggedScorecards.map((s) => s.actor));
+    let tp = 0;
+    flagged.forEach((a) => {
+      if (truth.has(a)) tp++;
+    });
+    const fp = Math.max(0, flagged.size - tp);
+    let fn = 0;
+    truth.forEach((a) => {
+      if (!flagged.has(a)) fn++;
+    });
+    const precision = flagged.size > 0 ? tp / flagged.size : 0;
+    const recall = truth.size > 0 ? tp / truth.size : 0;
+    const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+    return { tp, fp, fn, precision, recall, f1, truth: truth.size, flagged: flagged.size };
+  }, [flaggedScorecards, syntheticGroundTruth]);
 
   const assistantKnowledge = useMemo(() => {
     const entries: Array<{ title: string; patterns: string[]; answer: () => string }> = [
@@ -536,6 +594,13 @@ export default function Home() {
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
+      // Guard: large files can freeze the browser when parsing client-side.
+      const maxBytes = 50 * 1024 * 1024; // 50MB
+      if (file.size > maxBytes) {
+        alert(`File is too large (${Math.round(file.size / (1024 * 1024))}MB). Please upload a file smaller than 50MB or split it into chunks.`);
+        event.target.value = '';
+        return;
+      }
       setSourceError(null);
       const fileType = file.name.split('.').pop()?.toLowerCase();
       if (fileType === 'csv') {
@@ -631,6 +696,7 @@ export default function Home() {
   };
 
   const startAnalysis = () => {
+    if (isAnalyzing) return;
     runAnalysis(logs);
   };
 
@@ -991,6 +1057,7 @@ export default function Home() {
               <TabButton tab="results" label="Results" />
               <TabButton tab="review" label="Review" />
               <TabButton tab="evidence" label="Evidence" />
+              <TabButton tab="miniapp" label="Mini-App" />
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -1101,6 +1168,17 @@ export default function Home() {
                 <div className="mt-3 text-sm text-slate-300">
                   Threshold: <span className="font-medium text-slate-100">{settings.threshold.toFixed(2)}</span>
                 </div>
+                {syntheticMetrics && (
+                  <div className="mt-3 border border-slate-800 bg-black/40 rounded-lg p-3">
+                    <div className="text-sm font-medium">Synthetic validation</div>
+                    <div className="mt-1 text-xs text-slate-300">
+                      Precision {syntheticMetrics.precision.toFixed(2)} · Recall {syntheticMetrics.recall.toFixed(2)} · F1 {syntheticMetrics.f1.toFixed(2)}
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      TP {syntheticMetrics.tp} · FP {syntheticMetrics.fp} · FN {syntheticMetrics.fn} · Truth {syntheticMetrics.truth} · Flagged {syntheticMetrics.flagged}
+                    </div>
+                  </div>
+                )}
               </Card>
 
               <Card title="What’s Included" subtitle="Signals we compute automatically">
@@ -1247,6 +1325,57 @@ export default function Home() {
                 </div>
               </div>
             </Card>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <Card title="Top PageRank" subtitle="Influential nodes in the interaction graph">
+                <ul className="text-sm text-slate-200 space-y-1">
+                  {insights.topPageRank.length === 0 && <li className="text-slate-500">No graph yet</li>}
+                  {insights.topPageRank.map((x) => (
+                    <li key={x.key} className="flex items-center justify-between gap-3">
+                      <span className="truncate">{x.key}</span>
+                      <span className="text-slate-400">{x.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+              <Card title="Top Betweenness" subtitle="Bridge-like nodes that connect groups">
+                <ul className="text-sm text-slate-200 space-y-1">
+                  {insights.topBetweenness.length === 0 && <li className="text-slate-500">No graph yet</li>}
+                  {insights.topBetweenness.map((x) => (
+                    <li key={x.key} className="flex items-center justify-between gap-3">
+                      <span className="truncate">{x.key}</span>
+                      <span className="text-slate-400">{x.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+              <Card title="Top Eigenvector" subtitle="Highly-connected within highly-connected neighborhoods">
+                <ul className="text-sm text-slate-200 space-y-1">
+                  {insights.topEigen.length === 0 && <li className="text-slate-500">No graph yet</li>}
+                  {insights.topEigen.map((x) => (
+                    <li key={x.key} className="flex items-center justify-between gap-3">
+                      <span className="truncate">{x.key}</span>
+                      <span className="text-slate-400">{x.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </div>
+
+            <Card title="Rapid Interaction" subtitle="Mini-app / bot-like behavior: max actions per minute">
+              <ul className="text-sm text-slate-200 space-y-1">
+                {insights.topRapidActors.length === 0 && <li className="text-slate-500">No events yet</li>}
+                {insights.topRapidActors.map((x) => (
+                  <li key={x.key} className="flex items-center justify-between gap-3">
+                    <span className="truncate">{x.key}</span>
+                    <span className="text-slate-400">{x.count}/min</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-2 text-xs text-slate-500">
+                Threshold: {settings.rapidActionsPerMinuteThreshold}/min · Consider lowering time bin to 1 minute for mini-app logs.
+              </div>
+            </Card>
           </>
         )}
 
@@ -1291,7 +1420,7 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="border rounded-lg p-3">
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
                 <div className="text-sm font-medium">Farcaster (connector)</div>
                 <div className="text-xs text-slate-400 mt-1">Requires a configured API backend (currently stubbed).</div>
                 <div className="mt-2 flex gap-2">
@@ -1299,37 +1428,54 @@ export default function Home() {
                     value={farcasterId}
                     onChange={(e) => setFarcasterId(e.target.value)}
                     placeholder="fid or username"
-                    className="flex-1 border rounded px-2 py-1 text-sm"
+                    className="flex-1 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500"
                   />
                   <button
                     onClick={() => fetchSource('/api/fetch/farcaster', { id: farcasterId.trim() }, 'Farcaster')}
-                    className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
+                    className="px-3 py-1.5 rounded border border-slate-800 bg-black/40 text-slate-200 text-sm hover:bg-slate-900/50"
                   >
                     Fetch
                   </button>
                 </div>
               </div>
 
-              <div className="border rounded-lg p-3">
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
                 <div className="text-sm font-medium">Base (connector)</div>
-                <div className="text-xs text-slate-400 mt-1">Fetches ERC-20 Transfer logs via <code>BASE_RPC_URL</code> (native ETH not included).</div>
+                <div className="text-xs text-slate-400 mt-1">Fetches ERC-20 Transfer logs (native ETH not included).</div>
                 <div className="mt-2 flex gap-2">
                   <input
                     value={baseAddress}
                     onChange={(e) => setBaseAddress(e.target.value)}
                     placeholder="0x wallet address"
-                    className="flex-1 border rounded px-2 py-1 text-sm"
+                    className="flex-1 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500"
                   />
                   <button
-                    onClick={() => fetchSource('/api/fetch/base', { address: baseAddress.trim(), maxBlocks: '5000', direction: 'both' }, 'Base')}
-                    className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
+                    onClick={() =>
+                      fetchSource(
+                        '/api/fetch/base',
+                        { address: baseAddress.trim(), maxBlocks: '5000', direction: 'both', ...(baseRpcUrl.trim() ? { rpcUrl: baseRpcUrl.trim() } : {}) },
+                        'Base',
+                      )
+                    }
+                    className="px-3 py-1.5 rounded border border-slate-800 bg-black/40 text-slate-200 text-sm hover:bg-slate-900/50"
                   >
                     Fetch
                   </button>
                 </div>
+                <div className="mt-2">
+                  <input
+                    value={baseRpcUrl}
+                    onChange={(e) => setBaseRpcUrl(e.target.value)}
+                    placeholder="Optional: https://… Base JSON-RPC URL (uses BASE_RPC_URL if set)"
+                    className="w-full border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500"
+                  />
+                  <div className="text-xs text-slate-500 mt-1">
+                    Tip: set <code>BASE_RPC_URL</code> in <code>.env.local</code> for private/local RPC endpoints.
+                  </div>
+                </div>
               </div>
 
-              <div className="border rounded-lg p-3">
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
                 <div className="text-sm font-medium">Talent Protocol (connector)</div>
                 <div className="text-xs text-slate-400 mt-1">If you have exports, use Import/Scan (currently stubbed).</div>
                 <div className="mt-2 flex gap-2">
@@ -1337,11 +1483,11 @@ export default function Home() {
                     value={talentId}
                     onChange={(e) => setTalentId(e.target.value)}
                     placeholder="handle / profile id"
-                    className="flex-1 border rounded px-2 py-1 text-sm"
+                    className="flex-1 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500"
                   />
                   <button
                     onClick={() => fetchSource('/api/fetch/talent', { id: talentId.trim() }, 'Talent')}
-                    className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
+                    className="px-3 py-1.5 rounded border border-slate-800 bg-black/40 text-slate-200 text-sm hover:bg-slate-900/50"
                   >
                     Fetch
                   </button>
@@ -1655,6 +1801,38 @@ export default function Home() {
         {activeTab === 'analysis' && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <Card title="Settings" subtitle="Tune detection without changing code">
+              <div className="flex flex-wrap gap-2 mb-3">
+                <button
+                  onClick={() =>
+                    setSettings((s) => ({
+                      ...s,
+                      timeBinMinutes: 1,
+                      waveMinCount: 50,
+                      waveMinActors: 10,
+                      rapidActionsPerMinuteThreshold: 50,
+                      entropyMinTotalActions: 20,
+                      positiveActions: Array.from(
+                        new Set([
+                          ...s.positiveActions,
+                          'tap',
+                          'claim',
+                          'reward',
+                          'mint',
+                          'swap',
+                          'follow',
+                          'star',
+                          'transfer',
+                        ]),
+                      ),
+                      churnActions: Array.from(new Set([...s.churnActions, 'unclaim', 'unlike', 'revoke'])),
+                    }))
+                  }
+                  className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 hover:bg-slate-900/50"
+                  title="Good defaults for high-volume mini-app/bot logs (1-minute bins + rapid/entropy signals)"
+                >
+                  Apply mini-app preset
+                </button>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <label className="text-sm text-slate-200 block">
                   Threshold (0–1)
@@ -1712,6 +1890,32 @@ export default function Home() {
                     className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
+                <label className="text-sm text-slate-200 block">
+                  Rapid actions threshold (/min)
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={settings.rapidActionsPerMinuteThreshold}
+                    onChange={(e) =>
+                      setSettings((s) => ({ ...s, rapidActionsPerMinuteThreshold: Math.max(1, Number.parseInt(e.target.value || '0', 10) || 1) }))
+                    }
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                  />
+                </label>
+                <label className="text-sm text-slate-200 block">
+                  Entropy min actions
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={settings.entropyMinTotalActions}
+                    onChange={(e) =>
+                      setSettings((s) => ({ ...s, entropyMinTotalActions: Math.max(0, Number.parseInt(e.target.value || '0', 10) || 0) }))
+                    }
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                  />
+                </label>
                 <label className="text-sm text-slate-200 block md:col-span-2">
                   Positive actions (graph edges)
                   <input
@@ -1750,10 +1954,10 @@ export default function Home() {
               <div className="mt-4">
                 <button
                   onClick={startAnalysis}
-                  disabled={!fileUploaded || logs.length === 0}
+                  disabled={!fileUploaded || logs.length === 0 || isAnalyzing}
                   className="px-3 py-2 rounded-md bg-emerald-500 text-slate-950 text-sm font-semibold disabled:opacity-50 hover:bg-emerald-400"
                 >
-                  Run analysis
+                  {isAnalyzing ? 'Analyzing…' : 'Run analysis'}
                 </button>
               </div>
             </Card>
@@ -1765,6 +1969,7 @@ export default function Home() {
                 <li>Cluster isolation: low external connections within components</li>
                 <li>Low diversity: many actions on few targets</li>
                 <li>Profile: suspicious/shared links + follower/following ratio</li>
+                <li>Mini-app: rapid actions/min + low target entropy</li>
                 <li>Extra: reciprocity, repeated bios, new-account flag</li>
               </ul>
               <p className="text-xs text-slate-400 mt-3">
@@ -1963,7 +2168,7 @@ export default function Home() {
                         </div>
                       </div>
                       <div className="mt-1 text-xs text-slate-400">
-                        Churn {s.churnScore} · Coord {s.coordinationScore.toFixed(2)} · Burst {s.burstRate.toFixed(2)} · Reciprocity {s.reciprocalRate.toFixed(2)} · Bio {s.bioSimilarityScore.toFixed(2)} · Handle {s.handlePatternScore.toFixed(2)} · Phish {s.phishingLinkScore.toFixed(2)} · New {s.newAccountScore}
+                        Churn {s.churnScore} · Coord {s.coordinationScore.toFixed(2)} · Burst {s.burstRate.toFixed(2)} · Rapid {s.maxActionsPerMinute}/min · Ent {s.targetEntropy.toFixed(2)} · Reciprocity {s.reciprocalRate.toFixed(2)} · Bio {s.bioSimilarityScore.toFixed(2)} · Handle {s.handlePatternScore.toFixed(2)} · Phish {s.phishingLinkScore.toFixed(2)} · PR {s.pagerank.toFixed(4)} · Betw {s.betweenness.toFixed(2)} · New {s.newAccountScore}
                       </div>
                       {s.reasons.length > 0 && (
                         <div className="mt-2 text-xs text-slate-200">
@@ -2035,12 +2240,86 @@ export default function Home() {
           </Card>
         )}
 
+        {activeTab === 'miniapp' && (
+          <div className="space-y-6">
+            <Card title="Mini-App Protection" subtitle="Enhanced detection for mini-app Sybil attacks (rapid interactions, wallet clusters, cross-app linking)">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Shared Wallets</h3>
+                  <p className="text-xs text-slate-300 mt-1">Actors sharing wallet addresses</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.sharedWallets.length > 0).length}
+                  </div>
+                </div>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Cross-App Activity</h3>
+                  <p className="text-xs text-slate-300 mt-1">Actors active on multiple platforms</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.crossAppPlatforms.length > 1).length}
+                  </div>
+                </div>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">High Session Count</h3>
+                  <p className="text-xs text-slate-300 mt-1">Actors with many short sessions</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.sessionCount > 5).length}
+                  </div>
+                </div>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Fraudulent Transactions</h3>
+                  <p className="text-xs text-slate-300 mt-1">Unusual amount patterns</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.fraudTxScore > 0.5).length}
+                  </div>
+                </div>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Rapid Interactions</h3>
+                  <p className="text-xs text-slate-300 mt-1">High actions per minute</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.maxActionsPerMinute > settings.rapidActionsPerMinuteThreshold).length}
+                  </div>
+                </div>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Low Target Entropy</h3>
+                  <p className="text-xs text-slate-300 mt-1">Focused on few targets</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.lowEntropyScore > 0.7).length}
+                  </div>
+                </div>
+              </div>
+            </Card>
+            <Card title="Top Mini-App Risks" subtitle="Actors with highest mini-app specific scores">
+              <ul className="space-y-2">
+                {scorecards
+                  .filter(s => s.sharedWallets.length > 0 || s.crossAppPlatforms.length > 1 || s.sessionCount > 5 || s.fraudTxScore > 0.5 || s.maxActionsPerMinute > settings.rapidActionsPerMinuteThreshold || s.lowEntropyScore > 0.7)
+                  .sort((a, b) => b.sybilScore - a.sybilScore)
+                  .slice(0, 10)
+                  .map((s) => (
+                    <li key={s.actor} className="flex items-center justify-between p-2 bg-black/30 border border-slate-800 rounded-lg">
+                      <div>
+                        <div className="text-sm font-medium text-slate-100">{s.actor}</div>
+                        <div className="text-xs text-slate-300">
+                          Score: {s.sybilScore.toFixed(2)} | Shared: {s.sharedWallets.length} | Cross: {s.crossAppPlatforms.length} | Sessions: {s.sessionCount} | Fraud: {s.fraudTxScore.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-sm font-bold text-red-400">{s.sybilScore > settings.threshold ? 'FLAGGED' : 'OK'}</div>
+                      </div>
+                    </li>
+                  ))}
+                {scorecards.length === 0 && <li className="text-slate-500">Run analysis to see mini-app risks.</li>}
+              </ul>
+            </Card>
+          </div>
+        )}
+
         {activeTab === 'review' && (
           <Card title="Human Review" subtitle="Confirm / dismiss / escalate flagged actors with notes (stored locally in IndexedDB)">
             <div className="text-sm text-slate-300">
               Flagged actors: <span className="font-semibold text-slate-100">{flaggedScorecards.length.toLocaleString()}</span>
             </div>
             <div className="mt-3 space-y-3">
+              {reviewsLoading && <div className="text-slate-500">Loading saved reviews…</div>}
               {flaggedScorecards.length === 0 && <div className="text-slate-500">Run analysis to populate flagged actors.</div>}
               {flaggedScorecards.slice(0, 100).map((s) => (
                 <div key={s.actor} className="border border-slate-800 bg-black/40 rounded-lg p-3">

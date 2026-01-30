@@ -75,6 +75,11 @@ export function isLikelyPhishingUrl(url: string): boolean {
     const labels = host.split('.').filter(Boolean);
     if (labels.length >= 5) return true; // excessive subdomains
     if (parsed.username || parsed.password) return true; // userinfo in URL
+    // Additional checks for mini-apps and scams
+    if (host.includes('miniapp') && host.includes('scam')) return true;
+    if (host.includes('wallet') && host.includes('drain')) return true;
+    if (host.includes('airdrop') && host.includes('free')) return true;
+    if (parsed.pathname.includes('login') && parsed.searchParams.has('redirect')) return true; // suspicious redirects
     return false;
   } catch {
     return false;

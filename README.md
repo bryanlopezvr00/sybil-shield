@@ -1,8 +1,8 @@
 # Sybil Shield (Sybil Attack Detection)
 
-Sybil Shield is a **local-first** Next.js app that helps you detect **coordinated farms** (Sybil clusters) and **scammer patterns** across social and onchain systems using explainable graph + timing + profile signals.
+Sybil Shield is a **local-first** Next.js app that helps you detect **coordinated farms** (Sybil clusters), **scammer patterns**, and **mini-app attacks** across social, onchain, and mini-app systems using explainable graph + timing + profile + behavioral signals.
 
-It’s designed for **human review**: you get an evidence pack with “why flagged” reasons, not automatic bans.
+It’s designed for **human review**: you get an evidence pack with "why flagged" reasons, not automatic bans. Now includes enhanced protection for mini-apps, where most Sybil attacks occur via rapid interactions, wallet clusters, and cross-platform coordination.
 
 ## What this catches (and why it works)
 
@@ -12,17 +12,22 @@ Sybil attackers typically optimize for scale and coordination:
 - **Bursty, synchronized actions** (waves) to manipulate rankings, airdrops, or reputation
 - **Low diversity** (many actions against few targets) and repetitive behavior
 - **Reusable templates**: similar handles, repeated bios, shared links, same domains
+- **Mini-app specific**: shared wallets, cross-app linking, session anomalies, fraudulent transaction patterns, rapid interactions, low target entropy
 
-This project focuses on signals that are **harder to fake** without losing the attacker’s operational efficiency.
+This project focuses on signals that are **harder to fake** without losing the attacker’s operational efficiency, now extended to mini-app ecosystems.
 
 ## UI (Tabs)
 
 - **Dashboard**: key counts + cheat-catching insights (top targets, suspicious domains, shared links, handle patterns)
 - **Data**: upload logs, fetch GitHub, import URLs, scan profile pages for data files
+- **Generator**: create synthetic attack data for testing
 - **Analysis**: settings + scoring explanation
+- **Assistant**: AI-powered Q&A for interpreting signals
 - **Graph**: interaction visualization
-- **Results**: clusters, waves, searchable actor scorecards with “why flagged”
+- **Results**: clusters, waves, searchable actor scorecards with "why flagged"
+- **Review**: human review mode with confirm/dismiss and notes (IndexedDB storage)
 - **Evidence**: copy/download the full JSON evidence pack
+- **Mini-App**: dedicated stats and top risks for mini-app Sybil detection (shared wallets, cross-app activity, sessions, fraud, rapid actions, entropy)
 
 ## Quickstart
 
@@ -90,7 +95,7 @@ The Evidence pack includes:
 
 - `clusters`: connected components + density/conductance metrics
 - `waves`: burst events per **action + target** in fixed time bins
-- `scorecards`: per-actor scores + link stats + “why flagged” reasons
+- `scorecards`: per-actor scores + link stats + "why flagged" reasons (now includes shared wallets, cross-app platforms, session count, fraud score)
 - `profileLinks`: all scanned links per actor (suspicious/shared)
 - `insights`: top targets, top suspicious domains, shared links, handle patterns, top waves
 
@@ -100,16 +105,16 @@ In practice, Sybil farms and scammers overlap (phishing, link-farming, impersona
 
 ### Link + domain risk
 
-- **Suspicious domains** (shorteners, known risky domains, and heuristics like punycode / IP literals)
-- **Shared links** across actors (common “farm destination” or phishing destination)
+- **Suspicious domains** (shorteners, known risky domains, and heuristics like punycode / IP literals, mini-app scams)
+- **Shared links** across actors (common "farm destination" or phishing destination)
 - **Low link diversity** (same domain repeated)
-- **Phishing-like URL heuristics**: punycode (`xn--`), IP-literal hosts, excessive subdomains, userinfo in URL
+- **Phishing-like URL heuristics**: punycode (`xn--`), IP-literal hosts, excessive subdomains, userinfo in URL, mini-app specific patterns
 
 These help catch campaigns where many accounts drive traffic to the same scam endpoint.
 
 ### Identity template reuse
 
-- **Handle pattern score**: repeated stems (e.g. `alice001`, `alice002`, …) and repeated “shapes”
+- **Handle pattern score**: repeated stems (e.g. `alice001`, `alice002`, …) and repeated "shapes"
 - **Repeated bio score**: identical bios across multiple actors (template reuse)
 
 ### Coordination and manipulation
@@ -117,11 +122,20 @@ These help catch campaigns where many accounts drive traffic to the same scam en
 - **Waves**: many actions in the same time bin, on the same target
 - **Churn**: heavy `unfollow/unstar` behavior
 - **Low target diversity**: actions concentrated on a small number of targets
+- **Rapid actions per minute**: bot-like behavior in mini-apps
+- **Low target entropy**: focused interactions
 
 ### Graph structure
 
 - **Cluster isolation**: components with low external connections (farm topology)
 - **Reciprocity**: mutual positive interactions (can indicate collusive boosting)
+
+### Mini-app specific signals
+
+- **Shared wallets**: actors using the same wallet addresses (common in Sybil farms)
+- **Cross-app linking**: actors active across multiple platforms
+- **Session anomalies**: high number of short sessions (bursts)
+- **Fraudulent transactions**: unusual amount patterns (high variance or uniform small amounts)
 
 ## Threat model and boundaries
 
@@ -131,6 +145,7 @@ These help catch campaigns where many accounts drive traffic to the same scam en
 - Dense identity clusters with low external edges (farms)
 - Link-farming campaigns (shared domains/URLs)
 - Airdrop-style farms *when you provide onchain event logs*
+- **Mini-app attacks**: rapid interactions, wallet clusters, cross-app coordination, session bursts, fraudulent transactions
 
 ### Out of scope (by default)
 
@@ -145,13 +160,17 @@ These help catch campaigns where many accounts drive traffic to the same scam en
 ## Project structure
 
 - `app/page.tsx` – UI + analysis pipeline (tabs, scoring, evidence)
+- `lib/analyze.ts` – core analysis engine (clustering, waves, scoring, mini-app detections)
 - `lib/profile.ts` – profile link extraction + anomaly scoring
 - `lib/urlResolvers.ts` – URL extraction + share-link → raw download resolver
 - `lib/scam.ts` – handle pattern signals + phishing-like URL heuristics
+- `lib/reviewStore.ts` – IndexedDB-based human review storage
+- `app/workers/analyzeWorker.ts` – Web Worker for offloading analysis
 - `app/api/import/url/route.ts` – import CSV/JSON from URLs (SSRF-safe, size limited)
 - `app/api/scan/links/route.ts` – scan pages to discover CSV/JSON links
 - `app/api/fetch/github/route.ts` – GitHub stargazer fetcher
 - `app/api/fetch/{base,farcaster,talent}/route.ts` – connector stubs (implement with keys/indexers)
+- `app/api/generate/synthetic/route.ts` – synthetic data generator
 
 ## Roadmap (high impact next)
 
@@ -313,11 +332,11 @@ Do NOT use: Redis as primary DB, Edge Config for logs, Mongo for graph analysis
 
 ## What to Add Next (Ordered)
 
-1. Synthetic attack generator
-2. GitHub App integration
+1. Enhanced mini-app API integrations (e.g., Telegram Mini Apps data fetching)
+2. GitHub App integration for private repos
 3. Onchain funding tree detection
-4. Human review mode
-5. Exportable platform report format
+4. Advanced ML-based clustering (Louvain/Leiden)
+5. Cross-platform correlation for broader detection
 
 ## What NOT to Claim
 
@@ -352,7 +371,7 @@ Outputs are risk flags, not accusations, to avoid doxxing.
 
 Even heuristic-based, the model is explicit and configurable:
 
-**SybilScore(actor) = 0.30 * coordinationScore + 0.20 * churnScore + 0.15 * clusterIsolationScore + 0.10 * newAccountScore + 0.10 * lowDiversityScore + 0.15 * profileAnomalyScore**
+**SybilScore(actor) = 0.30 * coordinationScore + 0.20 * churnScore + 0.15 * clusterIsolationScore + 0.10 * newAccountScore + 0.10 * lowDiversityScore + 0.15 * profileAnomalyScore + 0.05 * sharedWalletScore + 0.05 * crossAppScore + 0.05 * sessionScore + 0.05 * fraudScore**
 
 - **coordinationScore**: Fraction of actions in bursts (>10 in 5-min window).
 - **churnScore**: Number of unfollow/unstar actions.
@@ -360,6 +379,10 @@ Even heuristic-based, the model is explicit and configurable:
 - **newAccountScore**: 1 if account age < 7 days, else 0.
 - **lowDiversityScore**: 1 - (unique targets / total actions).
 - **profileAnomalyScore**: 1 if follower/following ratio < 0.1 or bio matches common spam patterns, or links to suspicious domains/shared links, else 0.
+- **sharedWalletScore**: 1 if actor shares wallets with others, else 0.
+- **crossAppScore**: 0.5 if actor active on multiple platforms, else 0.
+- **sessionScore**: Min(sessionCount / 10, 1) for high session frequency.
+- **fraudScore**: Transaction pattern anomaly score (0-1).
 
 Thresholds (e.g., SybilScore > 0.6) are configurable per platform. Tune via environment variables.
 
@@ -554,13 +577,10 @@ The app generates structured JSON reports for clusters, waves, actor scorecards,
     "churnScore": 0.8,
     "coordinationScore": 0.9,
     "noveltyScore": 0.1,
-    "confidence": "High"
-  },
-  "user2": {
-    "sybilScore": 0.72,
-    "churnScore": 0.8,
-    "coordinationScore": 0.9,
-    "noveltyScore": 0.1,
+    "sharedWallets": ["0x123...", "0x456..."],
+    "crossAppPlatforms": ["telegram", "twitter"],
+    "sessionCount": 12,
+    "fraudTxScore": 0.3,
     "confidence": "High"
   }
 }
@@ -582,19 +602,21 @@ These reports can be exported as JSON for further analysis or reporting to platf
 
 ## Technologies Used
 
-- Next.js 14
-- React
+- Next.js 16.1.6
+- React 19.2.3
 - TypeScript
 - Tailwind CSS
 - Cytoscape.js for graph visualization
 - PapaParse for CSV parsing
+- Web Workers for performance
+- IndexedDB for local storage
 
 ## Future Improvements
 
 - Integrate Python backend for advanced analysis (networkx, pandas).
 - Add ML models (LightGBM on subgraphs).
 - Support real API integrations (GitHub, Base, Binance).
-- Human review interface.
+- Enhance mini-app integrations (Telegram, Discord bots).
 - Anonymized reporting to platforms.
 
 ## References

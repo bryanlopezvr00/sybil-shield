@@ -24,6 +24,34 @@ type RpcLog = {
 
 const TRANSFER_TOPIC0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
+function isBlockedHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  if (h === 'localhost' || h.endsWith('.local')) return true;
+  if (h === '127.0.0.1' || h === '0.0.0.0' || h === '::1') return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) {
+    const [a, b] = h.split('.').map((x) => Number.parseInt(x, 10));
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+  }
+  return false;
+}
+
+function normalizePublicHttpsUrlInput(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== 'https:') return null;
+    if (isBlockedHost(url.hostname)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 function jsonRpc(url: string, method: string, params: unknown[], id: number) {
   return fetch(url, {
     method: 'POST',
@@ -124,19 +152,31 @@ function dedupeLogs(logs: RpcLog[]): RpcLog[] {
 }
 
 export async function GET(req: Request) {
-  const rpcUrl = process.env.BASE_RPC_URL;
+  const { searchParams } = new URL(req.url);
+  const rpcUrlParam = searchParams.get('rpcUrl');
+  const normalizedRpcUrlParam = rpcUrlParam ? normalizePublicHttpsUrlInput(rpcUrlParam) : null;
+  if (rpcUrlParam && !normalizedRpcUrlParam) {
+    return NextResponse.json(
+      {
+        error: 'Invalid `rpcUrl` (must be a public https URL; localhost/private IPs blocked).',
+        hint: 'If you need a private/local RPC endpoint, set BASE_RPC_URL in .env.local instead.',
+      },
+      { status: 400 },
+    );
+  }
+
+  const rpcUrl = normalizedRpcUrlParam || process.env.BASE_RPC_URL;
   if (!rpcUrl) {
     return NextResponse.json(
       {
         error: 'Base onchain fetch is not configured.',
-        hint: 'Set BASE_RPC_URL to a Base JSON-RPC endpoint (Alchemy/QuickNode/etc.).',
+        hint: 'Set BASE_RPC_URL in .env.local, or pass a public https `rpcUrl` query param.',
         requiredEnv: ['BASE_RPC_URL'],
       },
       { status: 501 },
     );
   }
 
-  const { searchParams } = new URL(req.url);
   const address = (searchParams.get('address') || '').trim().toLowerCase();
   const token = (searchParams.get('token') || '').trim();
   const maxBlocks = Math.min(Math.max(Number.parseInt(searchParams.get('maxBlocks') || '5000', 10) || 5000, 100), 20000);
@@ -238,4 +278,3 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'Base fetch failed' }, { status: 502 });
   }
 }
-

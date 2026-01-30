@@ -45,6 +45,18 @@ export function isSuspiciousDomain(url: string): boolean {
     'shorturl.at',
     'talent.app',
     'spam.example.com',
+    // Mini-app and scam related
+    'miniapp.com',
+    'telegram.org', // if not official
+    't.me', // careful, but some scams
+    'scamwallet.net',
+    'fakeapp.io',
+    'phishingsite.ru',
+    'malicious.link',
+    'crypto-scam.org',
+    'walletdrain.com',
+    'airdropscam.com',
+    'nftfraud.xyz',
   ]; // Add more as needed
   try {
     const hostname = new URL(url).hostname.toLowerCase();
