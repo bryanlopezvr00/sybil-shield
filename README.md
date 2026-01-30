@@ -1,123 +1,167 @@
-# Sybil Attack Detection
+# Sybil Shield (Sybil Attack Detection)
 
-A Next.js web application for detecting Sybil attacks in social and onchain platforms, where attackers organize in groups (e.g., WhatsApp) to create multiple fake accounts and coordinate attacks on specific users to manipulate leaderboards or rankings.
+Sybil Shield is a **local-first** Next.js app that helps you detect **coordinated farms** (Sybil clusters) and **scammer patterns** across social and onchain systems using explainable graph + timing + profile signals.
 
-## Overview
+It’s designed for **human review**: you get an evidence pack with “why flagged” reasons, not automatic bans.
 
-This app focuses on graph-based and behavioral signal analysis to identify Sybil clusters. It supports data from GitHub (followers/stars), Farcaster/Base (onchain transactions, follows/casts), Talent Protocol, and Binance/Web3 (wallet clusters, trade patterns). The app visualizes interaction graphs, detects coordinated timing, behavioral anomalies, and churn signals to flag potential Sybil farms.
+## What this catches (and why it works)
 
-## Use Cases
+Sybil attackers typically optimize for scale and coordination:
 
-- Defending open-source maintainers from coordinated ranking manipulation
-- Auditing airdrop eligibility and wallet farms
-- Investigating social graph abuse on emerging platforms
+- **Dense internal graphs** with limited external connectivity (farms)
+- **Bursty, synchronized actions** (waves) to manipulate rankings, airdrops, or reputation
+- **Low diversity** (many actions against few targets) and repetitive behavior
+- **Reusable templates**: similar handles, repeated bios, shared links, same domains
 
-## Features
+This project focuses on signals that are **harder to fake** without losing the attacker’s operational efficiency.
 
-- Data upload for logs (CSV or JSON format: timestamp, actor, target, action, platform)
-- Profile scanning for behavioral anomalies (account age, bio patterns, follower/following ratios)
-- Graph visualization of interactions using Cytoscape.js
-- Detection of tight clusters (potential Sybil farms)
-- Timing coordination analysis (mass actions in short windows)
-- Churn signal detection (high follow/unfollow or star/unstar waves)
-- Behavioral anomaly scoring
-- Output of suspicious clusters, waves, and high-churn actors
+## UI (Tabs)
 
-## Threat Model
+- **Dashboard**: key counts + cheat-catching insights (top targets, suspicious domains, shared links, handle patterns)
+- **Data**: upload logs, fetch GitHub, import URLs, scan profile pages for data files
+- **Analysis**: settings + scoring explanation
+- **Graph**: interaction visualization
+- **Results**: clusters, waves, searchable actor scorecards with “why flagged”
+- **Evidence**: copy/download the full JSON evidence pack
 
-### In-Scope Attacks
+## Quickstart
 
-- Coordinated star/follow/unfollow waves targeting specific users to manipulate rankings.
-- "Coordinated identity clusters": Dense internal interactions (mutual follows/stars) with low external connections.
-- Airdrop-style wallet farms: Funding trees, shared funding sources, or clustered transfers.
-- Cross-platform reuse: Same handle or wallet patterns across platforms.
+```bash
+npm install
+npm run dev
+```
 
-### Out-of-Scope
+Open `http://localhost:3000`.
 
-- IP-based fingerprinting (unless user provides server logs with IPs).
-- Private group evidence (e.g., WhatsApp/Telegram chats)—only inferred via timing and graph patterns.
-- "Single-account harassment" (not Sybil, as it doesn't involve multiple identities).
+Optional environment variables:
 
-This scope prevents unrealistic expectations and focuses on detectable Sybil behaviors.
+- `GITHUB_TOKEN` – increases GitHub API rate limits for fetching stargazers
 
-## System Boundaries
+## Getting data into the system
 
-- The system does **not** automatically block, ban, or report accounts.
-- All outputs are **decision-support signals** intended for human review.
-- Final enforcement actions (reporting, moderation, bans) are explicitly out of scope.
-- The system prioritizes **false-negative tolerance over false positives** by default.
+### 1) Upload CSV or JSON
 
-## Research Background
+Upload a file with events. The app parses and analyzes locally in the browser.
 
-### What is a Sybil Attack?
+### 2) Import from URLs (works with “everything”)
 
-Sybil attacks involve creating multiple fake identities to manipulate systems. In leaderboards or social platforms, attackers organize in external groups (e.g., WhatsApp) to plan coordinated attacks on specific users, such as mass unfollows/unstars to push them down rankings.
+Paste any text containing links (chat messages, docs, issues). The server:
 
-### Detection Approach
+- extracts URLs
+- resolves common “share” links into raw download URLs
+- downloads `.csv` / `.json` (size-limited) and ingests as events
 
-Focus on graph-based + behavioral signals, inspired by open-source projects:
+Resolvers include GitHub (blob→raw), Gist (→/raw), GitLab (blob→raw), Bitbucket (`raw=1`), Google Drive (direct download), Dropbox (`dl=1`), OneDrive (`download=1`), HuggingFace (blob→resolve).
 
-- **Graph Clustering**: High mutual interactions in tightly connected components.
-- **Timing Coordination**: Actions within seconds/minutes.
-- **Behavioral Anomalies**: Low unique activity, repeated patterns, new accounts farming rewards.
-- **Profile Analysis**: Account age, bio similarity, follower/following ratios.
+### 3) Scan profile links (auto-find CSV/JSON)
 
-### Profile Link Scanning
+Paste profile URLs (GitHub, Talent, Farcaster pages, etc.). The server fetches HTML, extracts links, applies resolvers, and lists any `.csv` / `.json` data files it discovers.
 
-To detect coordinated link farming or spam patterns:
+### 4) GitHub: Fetch stargazers
 
-- Extract URLs from bio text
-- Flag suspicious domains (e.g., link shorteners, known spam sites)
-- Count shared links across accounts
-- Detect patterns like identical or similar URLs
-- Weight anomalies in profileAnomalyScore
+Fetch timestamped `star` events for `owner/repo` via the GitHub API:
 
-Functions:
+- API: `app/api/fetch/github/route.ts`
+- Output: normalized log entries for analysis
 
-- `extractLinks(bio: string): string[]` - Parse URLs from bio
-- `isSuspiciousDomain(url: string): boolean` - Check against blacklist
-- `sharedLinkCount(actors: string[], links: Map<string, string[]>): number` - Count overlapping links
-- `linkDiversityScore(links: string[]): number` - Unique domains / total links
-- `updateProfileAnomalyScore(actor: string, links: string[]): number` - Incorporate into scoring
+## Event schema (CSV/JSON)
 
-This helps identify Sybil farms promoting the same content.
-- **Churn Signals**: Sudden waves of follow/unfollow or star/unstar.
-- **Regional/Geographic Clustering**: If IP/language data available.
+Required:
 
-### Why Graph-Based First?
+- `timestamp` (ISO8601)
+- `platform` (e.g. `github`, `farcaster`, `base`, `talent`, `binance`, `custom`)
+- `action` (e.g. `follow`, `unfollow`, `star`, `unstar`, `transfer`, `fork`, `comment`, `issue`, `pr`)
+- `actor` (handle or wallet)
+- `target` (user/repo/wallet/etc.)
 
-Pure ML approaches struggle with explainability and adversarial adaptation.
-Graph-based methods provide:
+Optional (used by extra signals if provided):
 
-- Transparent evidence (clusters, edges, timing)
-- Human-verifiable explanations
-- Resistance to simple feature spoofing
+- `actorCreatedAt` (ISO8601) – enables new-account scoring
+- `bio` – enables bio similarity + link extraction
+- `links` (array of URLs, or JSON string in CSV) – enables link signals
+- `followerCount`, `followingCount`
+- `verified` (boolean-ish)
+- `location` (string)
+- `amount`, `txHash`, `blockNumber`, `meta`, `targetType`
 
-ML is treated as an augmentation layer, not the primary decision-maker.
+## Detection outputs
 
-### Data Sources
+The Evidence pack includes:
 
-- GitHub: Followers list, stargazers per repo (via API or exports).
-- Farcaster/Base: Onchain txns (Base explorer), follows/casts (Farcaster hubs).
-- Talent Protocol: Talent scores, endorsements, and builder interactions.
-- Binance/Web3: Wallet clusters, trade patterns.
-- Logs: Timestamps of actions, regional/IP hints.
+- `clusters`: connected components + density/conductance metrics
+- `waves`: burst events per **action + target** in fixed time bins
+- `scorecards`: per-actor scores + link stats + “why flagged” reasons
+- `profileLinks`: all scanned links per actor (suspicious/shared)
+- `insights`: top targets, top suspicious domains, shared links, handle patterns, top waves
 
-### Algorithm Overview
+## Built-in scammer / cheater signals
 
-1. Build interaction graph from positive actions (follow, star, txn).
-2. Detect large clusters (>5 nodes).
-3. Analyze timing in 5-min bins for coordinated waves.
-4. Score churn per actor.
-5. Flag suspicious entities.
+In practice, Sybil farms and scammers overlap (phishing, link-farming, impersonation, fake endorsements). Sybil Shield includes:
 
-### Action Semantics
+### Link + domain risk
 
-Actions are categorized to reduce false positives:
+- **Suspicious domains** (shorteners, known risky domains, and heuristics like punycode / IP literals)
+- **Shared links** across actors (common “farm destination” or phishing destination)
+- **Low link diversity** (same domain repeated)
+- **Phishing-like URL heuristics**: punycode (`xn--`), IP-literal hosts, excessive subdomains, userinfo in URL
 
-- **Positive edges** (graph-building): follow, star, transfer, fork
-- **Negative edges** (churn signals): unfollow, unstar
-- **Neutral actions**: comment, issue, PR (contextual weighting only)
+These help catch campaigns where many accounts drive traffic to the same scam endpoint.
+
+### Identity template reuse
+
+- **Handle pattern score**: repeated stems (e.g. `alice001`, `alice002`, …) and repeated “shapes”
+- **Repeated bio score**: identical bios across multiple actors (template reuse)
+
+### Coordination and manipulation
+
+- **Waves**: many actions in the same time bin, on the same target
+- **Churn**: heavy `unfollow/unstar` behavior
+- **Low target diversity**: actions concentrated on a small number of targets
+
+### Graph structure
+
+- **Cluster isolation**: components with low external connections (farm topology)
+- **Reciprocity**: mutual positive interactions (can indicate collusive boosting)
+
+## Threat model and boundaries
+
+### In scope
+
+- Coordinated follow/star/unfollow/unstar waves (ranking manipulation)
+- Dense identity clusters with low external edges (farms)
+- Link-farming campaigns (shared domains/URLs)
+- Airdrop-style farms *when you provide onchain event logs*
+
+### Out of scope (by default)
+
+- IP/device fingerprinting (unless you import such logs yourself)
+- Private chat evidence (WhatsApp/Telegram) — only inferred via timing + behavior
+
+### Safety & ethics
+
+- No automatic bans/blocks. Outputs are **decision-support** for maintainers/analysts.
+- Prefer reviewing evidence packs before reporting or enforcement.
+
+## Project structure
+
+- `app/page.tsx` – UI + analysis pipeline (tabs, scoring, evidence)
+- `lib/profile.ts` – profile link extraction + anomaly scoring
+- `lib/urlResolvers.ts` – URL extraction + share-link → raw download resolver
+- `lib/scam.ts` – handle pattern signals + phishing-like URL heuristics
+- `app/api/import/url/route.ts` – import CSV/JSON from URLs (SSRF-safe, size limited)
+- `app/api/scan/links/route.ts` – scan pages to discover CSV/JSON links
+- `app/api/fetch/github/route.ts` – GitHub stargazer fetcher
+- `app/api/fetch/{base,farcaster,talent}/route.ts` – connector stubs (implement with keys/indexers)
+
+## Roadmap (high impact next)
+
+- Base transfers via `BASE_RPC_URL` (or an indexer), funding-tree/common-funder signals
+- Farcaster fetch via `NEYNAR_API_KEY` (or hub), follow/cast graphs
+- Stronger scam detection: brand-impersonation domain lists, redirect-chain analysis, optional allowlist mode for imports
+
+## License
+
+MIT
 
 Only positive edges contribute to cluster topology.
 Negative edges are used exclusively for churn and wave detection.

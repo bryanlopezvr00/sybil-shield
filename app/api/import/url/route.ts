@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import Papa from 'papaparse';
+import { extractUrlsFromText, resolveUrlVariants } from '../../../../lib/urlResolvers';
 
 type ImportRequestBody = {
   urls?: unknown;
@@ -124,7 +125,8 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as ImportRequestBody;
   const urls = Array.isArray(body.urls) ? body.urls.map(String) : [];
 
-  const normalized = urls
+  const expandedInputs = urls.flatMap((u) => extractUrlsFromText(u));
+  const normalized = (expandedInputs.length > 0 ? expandedInputs : urls)
     .map(normalizeUrlInput)
     .filter((u): u is string => Boolean(u));
 
@@ -132,18 +134,30 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'No valid URLs provided.' }, { status: 400 });
   }
 
-  const results: { url: string; ok: boolean; error?: string; count?: number }[] = [];
+  const results: { url: string; resolvedUrl?: string; ok: boolean; error?: string; count?: number }[] = [];
   const allLogs: LogEntry[] = [];
 
   for (const url of normalized) {
     try {
-      const { contentType, text } = await fetchTextWithLimit(url);
-      const isCsv = contentType.includes('text/csv') || url.toLowerCase().endsWith('.csv');
-      const isJson = contentType.includes('application/json') || url.toLowerCase().endsWith('.json');
-      if (!isCsv && !isJson) throw new Error(`Unsupported content type: ${contentType || 'unknown'}`);
-      const parsed = isCsv ? parseCsv(text) : parseJson(text);
-      allLogs.push(...parsed);
-      results.push({ url, ok: true, count: parsed.length });
+      const candidates = resolveUrlVariants(url).map((v) => v.url);
+      let imported = false;
+      let lastError: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          const { contentType, text } = await fetchTextWithLimit(candidate);
+          const isCsv = contentType.includes('text/csv') || candidate.toLowerCase().endsWith('.csv');
+          const isJson = contentType.includes('application/json') || candidate.toLowerCase().endsWith('.json');
+          if (!isCsv && !isJson) throw new Error(`Unsupported content type: ${contentType || 'unknown'}`);
+          const parsed = isCsv ? parseCsv(text) : parseJson(text);
+          allLogs.push(...parsed);
+          results.push({ url, resolvedUrl: candidate, ok: true, count: parsed.length });
+          imported = true;
+          break;
+        } catch (e) {
+          lastError = e instanceof Error ? e.message : 'Import failed';
+        }
+      }
+      if (!imported) throw new Error(lastError || 'Import failed');
     } catch (e) {
       results.push({ url, ok: false, error: e instanceof Error ? e.message : 'Import failed' });
     }
@@ -155,4 +169,3 @@ export async function POST(req: Request) {
     logs: allLogs,
   });
 }
-

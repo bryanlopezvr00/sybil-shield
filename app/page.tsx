@@ -2,8 +2,12 @@
 
 import dynamic from 'next/dynamic';
 import { useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
+import Image from 'next/image';
 import type { EdgeDefinition, ElementDefinition, NodeDefinition, NodeSingular } from 'cytoscape';
 import { computeSharedLinksByActor, extractLinks, isSuspiciousDomain, linkDiversityScore, normalizeLinks, updateProfileAnomalyScore } from '../lib/profile';
+import { extractUrlsFromText } from '../lib/urlResolvers';
+import { computeHandlePatternScores, isLikelyPhishingUrl } from '../lib/scam';
 import Papa from 'papaparse';
 
 // Dynamically import CytoscapeComponent to avoid SSR issues
@@ -24,6 +28,9 @@ interface LogEntry {
   blockNumber?: number;
   meta?: string;
   targetType?: string;
+  actorCreatedAt?: string;
+  verified?: boolean;
+  location?: string;
 }
 
 interface DetailedCluster {
@@ -56,6 +63,13 @@ interface ActorScorecard {
   suspiciousLinks: string[];
   sharedLinks: string[];
   linkDiversity: number;
+  reciprocalRate: number;
+  burstRate: number;
+  newAccountScore: number;
+  bioSimilarityScore: number;
+  handlePatternScore: number;
+  phishingLinkScore: number;
+  reasons: string[];
 }
 
 interface ActorStats {
@@ -66,6 +80,10 @@ interface ActorStats {
   uniqueTargets: Set<string>;
   connections: number;
   clusterSize: number;
+  positiveOut: number;
+  positiveIn: number;
+  mutualPositive: number;
+  firstSeenMs?: number;
 }
 
 type CsvRow = Record<string, string | undefined>;
@@ -75,9 +93,12 @@ interface AnalysisSettings {
   minClusterSize: number;
   timeBinMinutes: number;
   waveMinCount: number;
+  waveMinActors: number;
   positiveActions: string[];
   churnActions: string[];
 }
+
+type TabKey = 'dashboard' | 'data' | 'analysis' | 'graph' | 'results' | 'evidence';
 
 export default function Home() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -90,9 +111,11 @@ export default function Home() {
     minClusterSize: 6,
     timeBinMinutes: 5,
     waveMinCount: 10,
+    waveMinActors: 8,
     positiveActions: ['follow', 'star', 'transfer', 'fork'],
     churnActions: ['unfollow', 'unstar'],
   });
+  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [fileUploaded, setFileUploaded] = useState(false);
   const [showAllActors, setShowAllActors] = useState(false);
   const [githubRepo, setGithubRepo] = useState('');
@@ -103,6 +126,55 @@ export default function Home() {
   const [farcasterId, setFarcasterId] = useState('');
   const [baseAddress, setBaseAddress] = useState('');
   const [talentId, setTalentId] = useState('');
+  const [profileLinksText, setProfileLinksText] = useState('');
+  const [scanFoundLinks, setScanFoundLinks] = useState<string[]>([]);
+  const [scanFoundDataFiles, setScanFoundDataFiles] = useState<string[]>([]);
+  const [scanDetails, setScanDetails] = useState<{ url: string; ok: boolean; error?: string; discoveredDataFiles?: string[] }[]>([]);
+  const [actorSearch, setActorSearch] = useState('');
+  const [profileScanText, setProfileScanText] = useState('');
+  const [profileScanResults, setProfileScanResults] = useState<
+    Array<{
+      inputUrl: string;
+      ok: boolean;
+      error?: string;
+      url?: string;
+      actorId?: string;
+      title?: string;
+      bio?: string;
+      links?: string[];
+      suspiciousLinks?: string[];
+      phishingLinks?: string[];
+      linkDiversity?: number;
+      profileAnomalyScore?: number;
+      riskScore?: number;
+      reasons?: string[];
+    }>
+  >([]);
+
+  const TabButton = ({ tab, label }: { tab: TabKey; label: string }) => (
+    <button
+      onClick={() => setActiveTab(tab)}
+      className={
+        activeTab === tab
+          ? 'px-3 py-2 rounded-md bg-slate-100 text-slate-950 text-sm shadow-sm'
+          : 'px-3 py-2 rounded-md border border-slate-800 bg-slate-950/40 text-sm text-slate-200 hover:bg-slate-900/50'
+      }
+    >
+      {label}
+    </button>
+  );
+
+  const Card = ({ title, subtitle, children }: { title: string; subtitle?: string; children: ReactNode }) => (
+    <section className="bg-black/50 border border-slate-800 rounded-xl p-4 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] backdrop-blur">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-base font-semibold">{title}</h2>
+          {subtitle && <p className="text-sm text-slate-300 mt-1">{subtitle}</p>}
+        </div>
+      </div>
+      <div className="mt-4">{children}</div>
+    </section>
+  );
 
   const logSummary = useMemo(() => {
     const uniqueActors = new Set<string>();
@@ -124,6 +196,102 @@ export default function Home() {
     };
   }, [logs]);
 
+  const flaggedScorecards = useMemo(
+    () => scorecards.filter((s) => s.sybilScore > settings.threshold).sort((a, b) => b.sybilScore - a.sybilScore),
+    [scorecards, settings.threshold],
+  );
+
+  const insights = useMemo(() => {
+    const top = (counts: Record<string, number>, limit: number) =>
+      Object.entries(counts)
+        .map(([key, count]) => ({ key, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, limit);
+
+    const targetCounts: Record<string, number> = {};
+    const churnTargetCounts: Record<string, number> = {};
+    const platformCounts: Record<string, number> = {};
+    logs.forEach((l) => {
+      targetCounts[l.target] = (targetCounts[l.target] || 0) + 1;
+      platformCounts[l.platform] = (platformCounts[l.platform] || 0) + 1;
+      if (settings.churnActions.includes(l.action)) {
+        churnTargetCounts[l.target] = (churnTargetCounts[l.target] || 0) + 1;
+      }
+    });
+
+    const suspiciousDomainCounts: Record<string, number> = {};
+    const sharedLinkCounts: Record<string, number> = {};
+    scorecards.forEach((s) => {
+      s.suspiciousLinks.forEach((link) => {
+        try {
+          const host = new URL(link).hostname.replace(/^www\./, '').toLowerCase();
+          suspiciousDomainCounts[host] = (suspiciousDomainCounts[host] || 0) + 1;
+        } catch {
+          // ignore
+        }
+      });
+      s.sharedLinks.forEach((link) => {
+        sharedLinkCounts[link] = (sharedLinkCounts[link] || 0) + 1;
+      });
+    });
+
+    const handlePatterns = computeHandlePatternScores(scorecards.map((s) => s.actor));
+    const topMap = (m: Map<string, number>, limit: number) =>
+      Array.from(m.entries())
+        .map(([key, count]) => ({ key, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, limit);
+
+    return {
+      counts: {
+        events: logs.length,
+        actors: logSummary.uniqueActors,
+        targets: logSummary.uniqueTargets,
+        flaggedActors: flaggedScorecards.length,
+        clusters: clusters.length,
+        waves: waves.length,
+      },
+      topTargetsByActions: top(targetCounts, 8),
+      topTargetsByChurn: top(churnTargetCounts, 8),
+      topSuspiciousDomains: top(suspiciousDomainCounts, 8),
+      topSharedLinks: top(sharedLinkCounts, 8),
+      topHandleStems: topMap(handlePatterns.stemCounts, 8),
+      topHandleShapes: topMap(handlePatterns.shapeCounts, 6),
+      topWaves: waves
+        .slice()
+        .sort((a, b) => b.actors.length - a.actors.length)
+        .slice(0, 8)
+        .map((w) => ({ windowStart: w.windowStart, action: w.action, target: w.target, actors: w.actors.length, zScore: w.zScore })),
+      platforms: top(platformCounts, 12),
+    };
+  }, [clusters.length, flaggedScorecards.length, logSummary.uniqueActors, logSummary.uniqueTargets, logs, scorecards, settings.churnActions, waves]);
+
+  const evidenceObject = useMemo(() => {
+    const profileLinks = Object.fromEntries(
+      scorecards.map((s) => [
+        s.actor,
+        {
+          links: s.links,
+          suspiciousLinks: s.suspiciousLinks,
+          sharedLinks: s.sharedLinks,
+          linkDiversity: s.linkDiversity,
+        },
+      ]),
+    );
+
+    return {
+      exportedAt: new Date().toISOString(),
+      settings,
+      insights,
+      clusters,
+      waves,
+      scorecards: flaggedScorecards,
+      profileLinks,
+    };
+  }, [clusters, insights, scorecards, flaggedScorecards, settings, waves]);
+
+  const evidenceJson = useMemo(() => JSON.stringify(evidenceObject, null, 2), [evidenceObject]);
+
   const parseLinksField = (value: unknown): string[] | undefined => {
     if (value === null || value === undefined) return undefined;
     if (Array.isArray(value)) return normalizeLinks(value.map(String));
@@ -139,6 +307,17 @@ export default function Home() {
       }
       const parts = trimmed.split(/[,\s]+/).filter(Boolean);
       return normalizeLinks(parts);
+    }
+    return undefined;
+  };
+
+  const parseBooleanField = (value: unknown): boolean | undefined => {
+    if (value === null || value === undefined) return undefined;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const v = value.trim().toLowerCase();
+      if (v === 'true' || v === '1' || v === 'yes') return true;
+      if (v === 'false' || v === '0' || v === 'no') return false;
     }
     return undefined;
   };
@@ -171,6 +350,9 @@ export default function Home() {
                     links: parseLinksField(row.links),
                     followerCount: row.followerCount ? parseInt(row.followerCount) : undefined,
                     followingCount: row.followingCount ? parseInt(row.followingCount) : undefined,
+                    actorCreatedAt: row.actorCreatedAt,
+                    location: row.location,
+                    verified: parseBooleanField(row.verified),
                   },
                 ];
               });
@@ -212,6 +394,9 @@ export default function Home() {
                   links: parseLinksField(record.links),
                   followerCount: typeof followerRaw === 'number' ? followerRaw : typeof followerRaw === 'string' ? parseInt(followerRaw) : undefined,
                   followingCount: typeof followingRaw === 'number' ? followingRaw : typeof followingRaw === 'string' ? parseInt(followingRaw) : undefined,
+                  actorCreatedAt: typeof record.actorCreatedAt === 'string' ? record.actorCreatedAt : undefined,
+                  location: typeof record.location === 'string' ? record.location : undefined,
+                  verified: parseBooleanField(record.verified),
                 },
               ];
             });
@@ -287,14 +472,11 @@ export default function Home() {
     }
   };
 
-  const importFromUrls = async () => {
+  const importFromUrls = async (overrideUrls?: string[]) => {
     try {
       setSourceError(null);
       setSourceStatus('Importing URLs...');
-      const urls = importUrlsText
-        .split(/\r?\n|,/g)
-        .map((u) => u.trim())
-        .filter(Boolean);
+      const urls = overrideUrls ?? extractUrlsFromText(importUrlsText);
       if (urls.length === 0) {
         setSourceError('Paste one or more CSV/JSON URLs to import.');
         setSourceStatus(null);
@@ -314,10 +496,89 @@ export default function Home() {
     }
   };
 
+  const scanProfileLinks = async () => {
+    try {
+      setSourceError(null);
+      setSourceStatus('Scanning profile links...');
+      setScanFoundLinks([]);
+      setScanFoundDataFiles([]);
+      setScanDetails([]);
+      const urls = extractUrlsFromText(profileLinksText);
+      if (urls.length === 0) {
+        setSourceError('Paste one or more profile URLs to scan.');
+        setSourceStatus(null);
+        return;
+      }
+      const res = await fetch('/api/scan/links', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ urls }),
+      });
+      const json = (await res.json()) as {
+        error?: string;
+        links?: string[];
+        dataFiles?: string[];
+        pages?: { url: string; ok: boolean; error?: string; discoveredDataFiles?: string[] }[];
+      };
+      if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+      setScanFoundLinks(json.links || []);
+      setScanFoundDataFiles(json.dataFiles || []);
+      setScanDetails(json.pages || []);
+      setSourceStatus(`Scan complete: found ${(json.dataFiles || []).length} CSV/JSON file link(s)`);
+    } catch (e) {
+      setSourceStatus(null);
+      setSourceError(e instanceof Error ? e.message : 'Failed to scan profile links');
+    }
+  };
+
+  const importScannedDataFiles = async () => {
+    setImportUrlsText(scanFoundDataFiles.join('\n'));
+    await importFromUrls(scanFoundDataFiles);
+  };
+
+  const scanProfilesForAnomalies = async () => {
+    try {
+      setSourceError(null);
+      setSourceStatus('Scanning profiles for anomalies...');
+      setProfileScanResults([]);
+      const urls = extractUrlsFromText(profileScanText);
+      if (urls.length === 0) {
+        setSourceError('Paste one or more profile URLs to scan.');
+        setSourceStatus(null);
+        return;
+      }
+      const res = await fetch('/api/scan/profile', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ urls }),
+      });
+      const json = (await res.json()) as { error?: string; profiles?: typeof profileScanResults };
+      if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+      setProfileScanResults(json.profiles || []);
+      setSourceStatus(`Profile scan complete: ${(json.profiles || []).length} scanned`);
+    } catch (e) {
+      setSourceStatus(null);
+      setSourceError(e instanceof Error ? e.message : 'Failed to scan profiles');
+    }
+  };
+
   const processData = (data: LogEntry[]) => {
     try {
+      if (data.length === 0) {
+        setElements([]);
+        setClusters([]);
+        setWaves([]);
+        setScorecards([]);
+        return;
+      }
+
+      const allTimes = data.map((l) => new Date(l.timestamp).getTime()).filter((t) => Number.isFinite(t));
+      const datasetStartMs = allTimes.length > 0 ? Math.min(...allTimes) : Date.now();
+
       // Collect profile data
-      const actorProfiles: { [actor: string]: { bio?: string; links?: string[]; followerCount?: number; followingCount?: number } } = {};
+      const actorProfiles: {
+        [actor: string]: { bio?: string; links?: string[]; followerCount?: number; followingCount?: number; actorCreatedAt?: string; verified?: boolean; location?: string };
+      } = {};
       data.forEach((log) => {
         if (!actorProfiles[log.actor]) {
           actorProfiles[log.actor] = {};
@@ -326,6 +587,9 @@ export default function Home() {
         if (log.links) actorProfiles[log.actor].links = normalizeLinks(log.links);
         if (log.followerCount !== undefined) actorProfiles[log.actor].followerCount = log.followerCount;
         if (log.followingCount !== undefined) actorProfiles[log.actor].followingCount = log.followingCount;
+        if (log.actorCreatedAt) actorProfiles[log.actor].actorCreatedAt = log.actorCreatedAt;
+        if (log.verified !== undefined) actorProfiles[log.actor].verified = log.verified;
+        if (log.location) actorProfiles[log.actor].location = log.location;
       });
 
       const linksByActor = new Map<string, string[]>();
@@ -336,9 +600,20 @@ export default function Home() {
       });
       const sharedLinksByActor = computeSharedLinksByActor(linksByActor);
 
+      const normalizedBioByActor = new Map<string, string>();
+      const bioCount = new Map<string, number>();
+      Object.entries(actorProfiles).forEach(([actor, profile]) => {
+        const bio = (profile.bio || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        if (!bio) return;
+        normalizedBioByActor.set(actor, bio);
+        bioCount.set(bio, (bioCount.get(bio) || 0) + 1);
+      });
+
       // Build graph from positive actions
       const nodes = new Set<string>();
       const edges: EdgeDefinition[] = [];
+      const positiveOut = new Map<string, Set<string>>();
+      const positiveIn = new Map<string, Set<string>>();
       data.forEach((log) => {
         nodes.add(log.actor);
         nodes.add(log.target);
@@ -346,6 +621,10 @@ export default function Home() {
           edges.push({
             data: { source: log.actor, target: log.target, type: 'interaction' },
           });
+          if (!positiveOut.has(log.actor)) positiveOut.set(log.actor, new Set());
+          if (!positiveIn.has(log.target)) positiveIn.set(log.target, new Set());
+          positiveOut.get(log.actor)!.add(log.target);
+          positiveIn.get(log.target)!.add(log.actor);
         }
       });
 
@@ -390,34 +669,37 @@ export default function Home() {
       }
       setClusters(clustersList);
 
-      // Timing coordination
-      const timeBins: { [key: string]: { [action: string]: { count: number; actors: Set<string>; targets: Set<string> } } } = {};
+      // Timing coordination (bin -> action -> target -> {count, actors})
+      const timeBins: Record<string, Record<string, Record<string, { count: number; actors: Set<string> }>>> = {};
+      const binSizeMs = Math.max(1, settings.timeBinMinutes) * 60 * 1000;
       data.forEach((log) => {
         const date = new Date(log.timestamp);
-        const binSizeMs = Math.max(1, settings.timeBinMinutes) * 60 * 1000;
         const bin = Math.floor(date.getTime() / binSizeMs) * binSizeMs;
         const binKey = new Date(bin).toISOString();
         if (!timeBins[binKey]) timeBins[binKey] = {};
-        if (!timeBins[binKey][log.action]) timeBins[binKey][log.action] = { count: 0, actors: new Set(), targets: new Set() };
-        timeBins[binKey][log.action].count++;
-        timeBins[binKey][log.action].actors.add(log.actor);
-        timeBins[binKey][log.action].targets.add(log.target);
+        if (!timeBins[binKey][log.action]) timeBins[binKey][log.action] = {};
+        if (!timeBins[binKey][log.action][log.target]) timeBins[binKey][log.action][log.target] = { count: 0, actors: new Set() };
+        timeBins[binKey][log.action][log.target].count++;
+        timeBins[binKey][log.action][log.target].actors.add(log.actor);
       });
 
       const suspiciousWaves: WaveResult[] = [];
       Object.entries(timeBins).forEach(([time, actions]) => {
-        Object.entries(actions).forEach(([action, { count, actors, targets }]) => {
-          if (count >= settings.waveMinCount) {
-            const windowEnd = new Date(new Date(time).getTime() + Math.max(1, settings.timeBinMinutes) * 60 * 1000).toISOString();
-            suspiciousWaves.push({
-              windowStart: time,
-              windowEnd,
-              action,
-              target: Array.from(targets)[0] || '', // assuming one target per wave
-              actors: Array.from(actors),
-              zScore: count / Math.max(1, settings.waveMinCount), // simplified
-            });
-          }
+        Object.entries(actions).forEach(([action, targets]) => {
+          Object.entries(targets).forEach(([target, info]) => {
+            const actorCount = info.actors.size;
+            if (info.count >= settings.waveMinCount && actorCount >= settings.waveMinActors) {
+              const windowEnd = new Date(new Date(time).getTime() + binSizeMs).toISOString();
+              suspiciousWaves.push({
+                windowStart: time,
+                windowEnd,
+                action,
+                target,
+                actors: Array.from(info.actors),
+                zScore: info.count / Math.max(1, settings.waveMinCount),
+              });
+            }
+          });
         });
       });
       setWaves(suspiciousWaves);
@@ -433,6 +715,9 @@ export default function Home() {
           uniqueTargets: new Set(),
           connections: graph[node].length,
           clusterSize: 0,
+          positiveOut: positiveOut.get(node)?.size ?? 0,
+          positiveIn: positiveIn.get(node)?.size ?? 0,
+          mutualPositive: 0,
         };
       });
 
@@ -441,6 +726,11 @@ export default function Home() {
         actorStats[log.actor].uniqueTargets.add(log.target);
         if (settings.churnActions.includes(log.action)) {
           actorStats[log.actor].churnActions++;
+        }
+        const ts = new Date(log.timestamp).getTime();
+        if (Number.isFinite(ts)) {
+          const current = actorStats[log.actor].firstSeenMs;
+          actorStats[log.actor].firstSeenMs = current === undefined ? ts : Math.min(current, ts);
         }
       });
 
@@ -451,28 +741,82 @@ export default function Home() {
         });
       });
 
-      // Coordination score: fraction in bursts
-      Object.values(timeBins).forEach((actions) => {
-        Object.values(actions).forEach(({ actors }) => {
-          actors.forEach((actor) => {
-            if (actorStats[actor]) actorStats[actor].burstActions++;
+      // Mutual (reciprocal) positive interactions
+      nodes.forEach((actor) => {
+        const outSet = positiveOut.get(actor) ?? new Set<string>();
+        let mutual = 0;
+        outSet.forEach((t) => {
+          const back = positiveOut.get(t);
+          if (back?.has(actor)) mutual++;
+        });
+        actorStats[actor].mutualPositive = mutual;
+      });
+
+      // Coordination score: fraction of actions that occur in "wave" bins
+      const waveBinsByActor = new Map<string, Set<string>>();
+      Object.entries(timeBins).forEach(([binKey, actions]) => {
+        Object.entries(actions).forEach(([action, targets]) => {
+          Object.entries(targets).forEach(([target, info]) => {
+            if (info.count >= settings.waveMinCount && info.actors.size >= settings.waveMinActors) {
+              const waveKey = `${binKey}:${action}:${target}`;
+              info.actors.forEach((actor) => {
+                if (!waveBinsByActor.has(actor)) waveBinsByActor.set(actor, new Set());
+                waveBinsByActor.get(actor)!.add(waveKey);
+              });
+            }
           });
         });
       });
+      Object.keys(actorStats).forEach((actor) => {
+        actorStats[actor].burstActions = waveBinsByActor.get(actor)?.size ?? 0;
+      });
+
+      const handlePatterns = computeHandlePatternScores(Array.from(nodes));
 
       const scorecardsList: ActorScorecard[] = Object.values(actorStats).map((stats) => {
-        const coordinationScore = stats.totalActions > 0 ? stats.burstActions / stats.totalActions : 0;
+        const coordinationScore = stats.totalActions > 0 ? Math.min(stats.burstActions / stats.totalActions, 1) : 0;
         const churnScore = stats.churnActions;
         const clusterIsolationScore = stats.clusterSize > 0 ? 1 - (stats.connections / stats.clusterSize) : 0;
-        const newAccountScore = 0; // placeholder, no age data
+        const createdAt = actorProfiles[stats.actor]?.actorCreatedAt;
+        const createdMs = createdAt ? new Date(createdAt).getTime() : undefined;
+        const firstSeenMs = stats.firstSeenMs ?? datasetStartMs;
+        const ageDays = createdMs && Number.isFinite(createdMs) ? (firstSeenMs - createdMs) / (24 * 60 * 60 * 1000) : undefined;
+        const newAccountScore = ageDays !== undefined && ageDays >= 0 && ageDays < 7 ? 1 : 0;
         const lowDiversityScore = stats.totalActions > 0 ? 1 - (stats.uniqueTargets.size / stats.totalActions) : 0;
         const profile = actorProfiles[stats.actor] || {};
         const links = linksByActor.get(stats.actor) ?? normalizeLinks(profile.links || (profile.bio ? extractLinks(profile.bio) : []));
         const suspiciousLinks = links.filter((link) => isSuspiciousDomain(link));
+        const phishingLinks = links.filter((link) => isLikelyPhishingUrl(link));
         const sharedLinks = sharedLinksByActor.get(stats.actor) ?? [];
         const linkDiversity = linkDiversityScore(links);
+        const reciprocalRate = stats.positiveOut > 0 ? stats.mutualPositive / stats.positiveOut : 0;
+        const burstRate = stats.totalActions > 0 ? Math.min(stats.burstActions / stats.totalActions, 1) : 0;
+        const bio = normalizedBioByActor.get(stats.actor);
+        const bioSimilarityScore = bio ? Math.min(((bioCount.get(bio) || 1) - 1) / 5, 1) : 0;
+        const handlePatternScore = handlePatterns.scoreByHandle.get(stats.actor) ?? 0;
+        const phishingLinkScore = phishingLinks.length > 0 ? Math.min(phishingLinks.length / 2, 1) : 0;
         const profileAnomalyScore = updateProfileAnomalyScore(stats.actor, links, profile.followerCount, profile.followingCount);
-        const sybilScore = 0.30 * coordinationScore + 0.20 * Math.min(churnScore / 10, 1) + 0.15 * clusterIsolationScore + 0.10 * newAccountScore + 0.10 * lowDiversityScore + 0.15 * profileAnomalyScore;
+
+        const sybilScore =
+          0.30 * coordinationScore +
+          0.20 * Math.min(churnScore / 10, 1) +
+          0.15 * clusterIsolationScore +
+          0.10 * newAccountScore +
+          0.10 * lowDiversityScore +
+          0.15 * profileAnomalyScore;
+
+        const reasons: string[] = [];
+        if (sybilScore > settings.threshold) reasons.push(`Score ${sybilScore.toFixed(2)} ≥ threshold ${settings.threshold.toFixed(2)}`);
+        if (coordinationScore >= 0.5) reasons.push(`High coordination (${coordinationScore.toFixed(2)})`);
+        if (churnScore >= 5) reasons.push(`High churn (${churnScore})`);
+        if (clusterIsolationScore >= 0.5 && stats.clusterSize >= settings.minClusterSize) reasons.push(`Cluster isolation (${clusterIsolationScore.toFixed(2)}) in cluster size ${stats.clusterSize}`);
+        if (lowDiversityScore >= 0.7) reasons.push(`Low target diversity (${lowDiversityScore.toFixed(2)})`);
+        if (suspiciousLinks.length > 0) reasons.push(`Suspicious link domains (${suspiciousLinks.length})`);
+        if (phishingLinks.length > 0) reasons.push(`Phishing-like URLs (${phishingLinks.length})`);
+        if (sharedLinks.length > 0) reasons.push(`Shared links with others (${sharedLinks.length})`);
+        if (bioSimilarityScore >= 0.4) reasons.push(`Repeated bio text (${bioSimilarityScore.toFixed(2)})`);
+        if (handlePatternScore >= 0.4) reasons.push(`Handle pattern similarity (${handlePatternScore.toFixed(2)})`);
+        if (newAccountScore === 1) reasons.push('New account (<7 days)');
         return {
           actor: stats.actor,
           sybilScore,
@@ -486,9 +830,17 @@ export default function Home() {
           suspiciousLinks,
           sharedLinks,
           linkDiversity,
+          reciprocalRate,
+          burstRate,
+          newAccountScore,
+          bioSimilarityScore,
+          handlePatternScore,
+          phishingLinkScore,
+          reasons,
         };
       });
       setScorecards(scorecardsList);
+      setActiveTab('results');
     } catch (error) {
       console.error('Error processing data:', error);
       alert('Error processing data. Check console for details.');
@@ -506,25 +858,7 @@ export default function Home() {
   };
 
   const exportEvidence = () => {
-    const profileLinks = Object.fromEntries(
-      scorecards.map((s) => [
-        s.actor,
-        {
-          links: s.links,
-          suspiciousLinks: s.suspiciousLinks,
-          sharedLinks: s.sharedLinks,
-          linkDiversity: s.linkDiversity,
-        },
-      ]),
-    );
-    const evidence = {
-      clusters,
-      waves,
-      scorecards: scorecards.filter(s => s.sybilScore > settings.threshold),
-      profileLinks,
-      settings,
-    };
-    const blob = new Blob([JSON.stringify(evidence, null, 2)], { type: 'application/json' });
+    const blob = new Blob([evidenceJson], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -533,158 +867,312 @@ export default function Home() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="bg-white border-b">
-        <div className="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">Sybil Attack Detection</h1>
-            <p className="text-sm text-slate-600">Detect coordinated clusters and churn across social + onchain signals</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => {
-                setLogs([]);
-                setElements([]);
-                setClusters([]);
-                setWaves([]);
-                setScorecards([]);
-                setFileUploaded(false);
-                setSourceStatus(null);
-                setSourceError(null);
-              }}
-              className="px-3 py-2 rounded border bg-white text-sm hover:bg-slate-50"
-            >
-              Reset
-            </button>
-            <button
-              onClick={exportEvidence}
-              disabled={logs.length === 0}
-              className="px-3 py-2 rounded bg-slate-900 text-white text-sm disabled:opacity-50"
-            >
-              Export evidence
-            </button>
+    <div className="min-h-screen bg-black text-slate-100">
+      <header className="bg-black/60 border-b border-slate-800 backdrop-blur">
+        <div className="mx-auto max-w-6xl px-4 py-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-center gap-3">
+              <Image src="/logo-mark.svg" alt="Sybil Shield" width={36} height={36} priority />
+              <div>
+                <h1 className="text-xl font-semibold tracking-tight">Sybil Shield</h1>
+                <p className="text-sm text-slate-300">Coordinated clusters • timing waves • churn • profile anomalies</p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <TabButton tab="dashboard" label="Dashboard" />
+              <TabButton tab="data" label="Data" />
+              <TabButton tab="analysis" label="Analysis" />
+              <TabButton tab="graph" label="Graph" />
+              <TabButton tab="results" label="Results" />
+              <TabButton tab="evidence" label="Evidence" />
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  setLogs([]);
+                  setElements([]);
+                  setClusters([]);
+                  setWaves([]);
+                  setScorecards([]);
+                  setFileUploaded(false);
+                  setSourceStatus(null);
+                  setSourceError(null);
+                  setActiveTab('dashboard');
+                }}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-slate-950/40 text-sm text-slate-200 hover:bg-slate-900/50"
+              >
+                Reset
+              </button>
+              <button
+                onClick={exportEvidence}
+                disabled={logs.length === 0}
+                className="px-3 py-2 rounded-md bg-gradient-to-r from-cyan-500 via-violet-500 to-emerald-500 text-slate-950 text-sm font-semibold disabled:opacity-50"
+              >
+                Export evidence
+              </button>
+            </div>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 py-6">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2 space-y-4">
-            <section className="bg-white border rounded-lg p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <h2 className="font-semibold">Data sources</h2>
-                  <p className="text-sm text-slate-600 mt-1">Upload logs or fetch from supported platforms.</p>
+      <main className="mx-auto max-w-6xl px-4 py-6 space-y-4">
+        {(sourceStatus || sourceError) && (
+          <div className="bg-black/50 border border-slate-800 rounded-xl p-3 backdrop-blur">
+            {sourceStatus && <div className="text-sm text-slate-200">{sourceStatus}</div>}
+            {sourceError && <div className="text-sm text-red-400">{sourceError}</div>}
+          </div>
+        )}
+
+        {activeTab === 'dashboard' && (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <Card title="Dataset" subtitle="What you loaded so far">
+                <div className="grid grid-cols-3 gap-3 text-sm">
+                  <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                    <div className="text-slate-400">Events</div>
+                    <div className="text-lg font-semibold">{logSummary.total.toLocaleString()}</div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                    <div className="text-slate-400">Actors</div>
+                    <div className="text-lg font-semibold">{logSummary.uniqueActors.toLocaleString()}</div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                    <div className="text-slate-400">Targets</div>
+                    <div className="text-lg font-semibold">{logSummary.uniqueTargets.toLocaleString()}</div>
+                  </div>
                 </div>
-                <button
-                  onClick={startAnalysis}
-                  disabled={!fileUploaded || logs.length === 0}
-                  className="px-4 py-2 rounded bg-emerald-600 text-white text-sm disabled:opacity-50 hover:bg-emerald-700"
-                >
-                  Run analysis
-                </button>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => {
+                      setActiveTab('data');
+                    }}
+                    className="px-3 py-2 rounded-md border border-slate-800 bg-slate-950/40 text-sm text-slate-200 hover:bg-slate-900/50"
+                  >
+                    Add data
+                  </button>
+                  <button
+                    onClick={startAnalysis}
+                    disabled={!fileUploaded || logs.length === 0}
+                    className="px-3 py-2 rounded-md bg-emerald-500 text-slate-950 text-sm font-semibold disabled:opacity-50 hover:bg-emerald-400"
+                  >
+                    Run analysis
+                  </button>
+                </div>
+              </Card>
+
+              <Card title="Detections" subtitle="Outputs after analysis">
+                <div className="grid grid-cols-3 gap-3 text-sm">
+                  <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                    <div className="text-slate-400">Flagged</div>
+                    <div className="text-lg font-semibold">{flaggedScorecards.length.toLocaleString()}</div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                    <div className="text-slate-400">Clusters</div>
+                    <div className="text-lg font-semibold">{clusters.length.toLocaleString()}</div>
+                  </div>
+                  <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                    <div className="text-slate-400">Waves</div>
+                    <div className="text-lg font-semibold">{waves.length.toLocaleString()}</div>
+                  </div>
+                </div>
+                <div className="mt-3 text-sm text-slate-300">
+                  Threshold: <span className="font-medium text-slate-100">{settings.threshold.toFixed(2)}</span>
+                </div>
+              </Card>
+
+              <Card title="What’s Included" subtitle="Signals we compute automatically">
+                <ul className="text-sm text-slate-200 list-disc pl-4 space-y-1">
+                  <li>Graph clusters (size, density, conductance)</li>
+                  <li>Timing waves (binning + min actors/count)</li>
+                  <li>Churn (unfollow/unstar counts)</li>
+                  <li>Profile anomalies (ratio + suspicious/shared links)</li>
+                  <li>Extra: reciprocity, repeated bios, new-account flag</li>
+                </ul>
+              </Card>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <Card title="Top Targets" subtitle="Who gets hit the most">
+                <div className="text-sm text-slate-200">
+                  <div className="font-medium text-slate-100">By actions</div>
+                  <ul className="mt-1 space-y-1">
+                    {insights.topTargetsByActions.length === 0 && <li className="text-slate-500">No data</li>}
+                    {insights.topTargetsByActions.map((t) => (
+                      <li key={t.key} className="flex items-center justify-between gap-3">
+                        <span className="truncate">{t.key}</span>
+                        <span className="text-slate-400">{t.count}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-3 font-medium text-slate-100">By churn</div>
+                  <ul className="mt-1 space-y-1">
+                    {insights.topTargetsByChurn.length === 0 && <li className="text-slate-500">No churn targets</li>}
+                    {insights.topTargetsByChurn.map((t) => (
+                      <li key={t.key} className="flex items-center justify-between gap-3">
+                        <span className="truncate">{t.key}</span>
+                        <span className="text-slate-400">{t.count}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </Card>
+
+              <Card title="Suspicious Domains" subtitle="Most common risky domains in bios">
+                <ul className="text-sm text-slate-200 space-y-1">
+                  {insights.topSuspiciousDomains.length === 0 && <li className="text-slate-500">No suspicious domains found</li>}
+                  {insights.topSuspiciousDomains.map((d) => (
+                    <li key={d.key} className="flex items-center justify-between gap-3">
+                      <span className="truncate">{d.key}</span>
+                      <span className="text-slate-400">{d.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+
+              <Card title="Shared Links" subtitle="Links reused across profiles">
+                <ul className="text-sm text-slate-200 space-y-1">
+                  {insights.topSharedLinks.length === 0 && <li className="text-slate-500">No shared links detected</li>}
+                  {insights.topSharedLinks.map((l) => (
+                    <li key={l.key} className="flex items-center justify-between gap-3">
+                      <a href={l.key} target="_blank" rel="noreferrer" className="truncate underline text-slate-200">
+                        {l.key}
+                      </a>
+                      <span className="text-slate-400">{l.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <Card title="Handle Patterns" subtitle="Common naming stems/shapes (sybil farms often reuse)">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-slate-200">
+                  <div>
+                    <div className="font-medium text-slate-100">Top stems</div>
+                    <ul className="mt-1 space-y-1">
+                      {insights.topHandleStems.length === 0 && <li className="text-slate-500">No stems</li>}
+                      {insights.topHandleStems.map((x) => (
+                        <li key={x.key} className="flex items-center justify-between gap-3">
+                          <span className="truncate">{x.key || '(empty)'}</span>
+                          <span className="text-slate-400">{x.count}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div>
+                    <div className="font-medium text-slate-100">Top shapes</div>
+                    <ul className="mt-1 space-y-1">
+                      {insights.topHandleShapes.length === 0 && <li className="text-slate-500">No shapes</li>}
+                      {insights.topHandleShapes.map((x) => (
+                        <li key={x.key} className="flex items-center justify-between gap-3">
+                          <span className="truncate">{x.key}</span>
+                          <span className="text-slate-400">{x.count}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </Card>
+
+              <Card title="Top Waves" subtitle="Largest coordinated bursts">
+                <ul className="text-sm text-slate-200 space-y-1">
+                  {insights.topWaves.length === 0 && <li className="text-slate-500">No waves</li>}
+                  {insights.topWaves.map((w) => (
+                    <li key={`${w.windowStart}:${w.action}:${w.target}`} className="flex items-center justify-between gap-3">
+                      <span className="truncate">
+                        {w.windowStart} · {w.action} · {w.target}
+                      </span>
+                      <span className="text-slate-400">{w.actors}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </div>
+          </>
+        )}
+
+        {activeTab === 'data' && (
+          <Card title="Data Sources" subtitle="Upload logs, fetch platform data, import or scan links">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                <div className="text-sm font-medium">Upload CSV/JSON</div>
+                <div className="text-xs text-slate-400 mt-1">
+                  Required: <code>timestamp, actor, target, action, platform</code>
+                </div>
+                <input type="file" accept=".csv,.json" onChange={handleFileUpload} className="mt-3 w-full text-sm" />
               </div>
 
-              <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="border rounded-lg p-3">
-                  <div className="text-sm font-medium">Upload CSV/JSON</div>
-                  <div className="text-xs text-slate-600 mt-1">
-                    Required: <code>timestamp, actor, target, action, platform</code>
-                  </div>
-                  <input type="file" accept=".csv,.json" onChange={handleFileUpload} className="mt-3 w-full text-sm" />
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                <div className="text-sm font-medium">GitHub stargazers</div>
+                <div className="text-xs text-slate-400 mt-1">
+                  Pulls timestamped <code>star</code> events for a repo.
                 </div>
-
-                <div className="border rounded-lg p-3">
-                  <div className="text-sm font-medium">GitHub stargazers</div>
-                  <div className="text-xs text-slate-600 mt-1">
-                    Pulls timestamped <code>star</code> events for a repo.
-                  </div>
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      value={githubRepo}
-                      onChange={(e) => setGithubRepo(e.target.value)}
-                      placeholder="owner/repo"
-                      className="flex-1 border rounded px-2 py-1 text-sm"
-                    />
-                    <input
-                      type="number"
-                      min={1}
-                      max={20}
-                      value={githubMaxPages}
-                      onChange={(e) => setGithubMaxPages(Math.min(20, Math.max(1, Number.parseInt(e.target.value || '3', 10) || 3)))}
-                      className="w-20 border rounded px-2 py-1 text-sm"
-                      title="Max pages (100 per page)"
-                    />
-                    <button onClick={fetchGithubStargazers} className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm hover:bg-blue-700">
-                      Fetch
-                    </button>
-                  </div>
-                  <div className="text-xs text-slate-500 mt-2">
-                    Optional: set <code>GITHUB_TOKEN</code> to raise rate limits.
-                  </div>
-                </div>
-
-                <div className="border rounded-lg p-3">
-                  <div className="text-sm font-medium">Farcaster (connector)</div>
-                  <div className="text-xs text-slate-600 mt-1">Requires a configured API backend (e.g., Neynar).</div>
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      value={farcasterId}
-                      onChange={(e) => setFarcasterId(e.target.value)}
-                      placeholder="fid or username"
-                      className="flex-1 border rounded px-2 py-1 text-sm"
-                    />
-                    <button
-                      onClick={() => fetchSource('/api/fetch/farcaster', { id: farcasterId.trim() }, 'Farcaster')}
-                      className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
-                    >
-                      Fetch
-                    </button>
-                  </div>
-                </div>
-
-                <div className="border rounded-lg p-3">
-                  <div className="text-sm font-medium">Base (connector)</div>
-                  <div className="text-xs text-slate-600 mt-1">Requires an RPC/indexer backend to pull transfers/events.</div>
-                  <div className="mt-2 flex gap-2">
-                    <input
-                      value={baseAddress}
-                      onChange={(e) => setBaseAddress(e.target.value)}
-                      placeholder="0x wallet address"
-                      className="flex-1 border rounded px-2 py-1 text-sm"
-                    />
-                    <button
-                      onClick={() => fetchSource('/api/fetch/base', { address: baseAddress.trim() }, 'Base')}
-                      className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
-                    >
-                      Fetch
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-3 border rounded-lg p-3">
-                <div className="text-sm font-medium">Import from URLs</div>
-                <div className="text-xs text-slate-600 mt-1">Paste direct links to <code>.csv</code> or <code>.json</code> exports (one per line).</div>
-                <textarea
-                  value={importUrlsText}
-                  onChange={(e) => setImportUrlsText(e.target.value)}
-                  placeholder="https://example.com/logs.csv\nhttps://example.com/logs.json"
-                  className="mt-2 w-full border rounded px-2 py-1 text-sm h-20"
-                />
-                <div className="mt-2">
-                  <button onClick={importFromUrls} className="px-3 py-1.5 rounded bg-slate-900 text-white text-sm hover:bg-slate-800">
-                    Import URLs
+                <div className="mt-2 flex gap-2">
+                  <input
+                    value={githubRepo}
+                    onChange={(e) => setGithubRepo(e.target.value)}
+                    placeholder="owner/repo"
+                    className="flex-1 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500"
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={githubMaxPages}
+                    onChange={(e) => setGithubMaxPages(Math.min(20, Math.max(1, Number.parseInt(e.target.value || '3', 10) || 3)))}
+                    className="w-20 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100"
+                    title="Max pages (100 per page)"
+                  />
+                  <button onClick={fetchGithubStargazers} className="px-3 py-1.5 rounded bg-cyan-500 text-slate-950 text-sm font-semibold hover:bg-cyan-400">
+                    Fetch
                   </button>
                 </div>
                 <div className="text-xs text-slate-500 mt-2">
-                  Safety: blocks localhost/private IP URLs and limits downloads to ~2MB per file.
+                  Optional: set <code>GITHUB_TOKEN</code> to raise rate limits.
                 </div>
               </div>
 
-              <div className="mt-3 border rounded-lg p-3">
+              <div className="border rounded-lg p-3">
+                <div className="text-sm font-medium">Farcaster (connector)</div>
+                <div className="text-xs text-slate-400 mt-1">Requires a configured API backend (currently stubbed).</div>
+                <div className="mt-2 flex gap-2">
+                  <input
+                    value={farcasterId}
+                    onChange={(e) => setFarcasterId(e.target.value)}
+                    placeholder="fid or username"
+                    className="flex-1 border rounded px-2 py-1 text-sm"
+                  />
+                  <button
+                    onClick={() => fetchSource('/api/fetch/farcaster', { id: farcasterId.trim() }, 'Farcaster')}
+                    className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
+                  >
+                    Fetch
+                  </button>
+                </div>
+              </div>
+
+              <div className="border rounded-lg p-3">
+                <div className="text-sm font-medium">Base (connector)</div>
+                <div className="text-xs text-slate-400 mt-1">Fetches ERC-20 Transfer logs via <code>BASE_RPC_URL</code> (native ETH not included).</div>
+                <div className="mt-2 flex gap-2">
+                  <input
+                    value={baseAddress}
+                    onChange={(e) => setBaseAddress(e.target.value)}
+                    placeholder="0x wallet address"
+                    className="flex-1 border rounded px-2 py-1 text-sm"
+                  />
+                  <button
+                    onClick={() => fetchSource('/api/fetch/base', { address: baseAddress.trim(), maxBlocks: '5000', direction: 'both' }, 'Base')}
+                    className="px-3 py-1.5 rounded bg-slate-700 text-white text-sm hover:bg-slate-800"
+                  >
+                    Fetch
+                  </button>
+                </div>
+              </div>
+
+              <div className="border rounded-lg p-3">
                 <div className="text-sm font-medium">Talent Protocol (connector)</div>
-                <div className="text-xs text-slate-600 mt-1">If you have exports, use Import from URLs / Upload.</div>
+                <div className="text-xs text-slate-400 mt-1">If you have exports, use Import/Scan (currently stubbed).</div>
                 <div className="mt-2 flex gap-2">
                   <input
                     value={talentId}
@@ -701,160 +1189,148 @@ export default function Home() {
                 </div>
               </div>
 
-              {(sourceStatus || sourceError) && (
-                <div className="mt-3">
-                  {sourceStatus && <div className="text-sm text-slate-700">{sourceStatus}</div>}
-                  {sourceError && <div className="text-sm text-red-700">{sourceError}</div>}
-                </div>
-              )}
-
-              <div className="mt-4 flex flex-wrap items-center gap-3 text-sm">
-                <div className="text-slate-600">
-                  Events: <span className="font-medium text-slate-900">{logSummary.total.toLocaleString()}</span>
-                </div>
-                <div className="text-slate-600">
-                  Actors: <span className="font-medium text-slate-900">{logSummary.uniqueActors.toLocaleString()}</span>
-                </div>
-                <div className="text-slate-600">
-                  Targets: <span className="font-medium text-slate-900">{logSummary.uniqueTargets.toLocaleString()}</span>
-                </div>
-              </div>
-            </section>
-
-            <section className="bg-white border rounded-lg p-4">
-              <div className="flex items-end justify-between gap-4">
-                <div>
-                  <h2 className="font-semibold">Graph</h2>
-                  <p className="text-sm text-slate-600 mt-1">Red nodes are above your threshold.</p>
-                </div>
-                <div className="text-sm text-slate-600">
-                  Threshold: <span className="font-medium text-slate-900">{settings.threshold.toFixed(2)}</span>
-                </div>
-              </div>
-              <div className="mt-3" style={{ width: '100%', height: '520px' }}>
-                <CytoscapeComponent
-                  elements={elements}
-                  style={{ width: '100%', height: '100%' }}
-                  stylesheet={[
-                    {
-                      selector: 'node',
-                      style: {
-                        'background-color': (ele: NodeSingular) => {
-                          const scorecard = scorecards.find(s => s.actor === ele.data('id'));
-                          return scorecard && scorecard.sybilScore > settings.threshold ? 'rgb(220 38 38)' : 'rgb(37 99 235)';
-                        },
-                        label: 'data(label)',
-                        'text-valign': 'center',
-                        'text-halign': 'center',
-                        'font-size': '10px',
-                        color: 'rgb(15 23 42)',
-                        'text-outline-color': 'white',
-                        'text-outline-width': 1,
-                      },
-                    },
-                    {
-                      selector: 'edge[type="interaction"]',
-                      style: {
-                        width: 2,
-                        'line-color': 'rgb(16 185 129)',
-                      },
-                    },
-                  ]}
-                  layout={{ name: 'cose' }}
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                <div className="text-sm font-medium">Import from URLs</div>
+                <div className="text-xs text-slate-400 mt-1">Paste any text; we’ll extract URLs and try to resolve raw CSV/JSON.</div>
+                <textarea
+                  value={importUrlsText}
+                  onChange={(e) => setImportUrlsText(e.target.value)}
+                  placeholder="Paste links from GitHub/Gist/Drive/Dropbox/etc..."
+                  className="mt-2 w-full border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500 h-24"
                 />
-              </div>
-            </section>
-
-            <section className="bg-white border rounded-lg p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <h2 className="font-semibold">Results</h2>
-                  <p className="text-sm text-slate-600 mt-1">Clusters, waves, and actor scorecards.</p>
+                <div className="mt-2">
+                  <button onClick={() => importFromUrls()} className="px-3 py-1.5 rounded bg-slate-100 text-slate-950 text-sm font-semibold hover:bg-white">
+                    Import URLs
+                  </button>
                 </div>
               </div>
 
-              <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="border rounded-lg p-3">
-                  <div className="text-sm font-medium">Clusters</div>
-                  <ul className="mt-2 text-sm text-slate-700 list-disc pl-4">
-                    {clusters.length === 0 && <li className="list-none text-slate-500">No clusters yet.</li>}
-                    {clusters.map((cluster) => (
-                      <li key={cluster.clusterId}>
-                        #{cluster.clusterId}: {cluster.members.length} members (density {cluster.density.toFixed(2)}, conductance {cluster.conductance.toFixed(2)})
-                      </li>
-                    ))}
-                  </ul>
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                <div className="text-sm font-medium">Scan profile links</div>
+                <div className="text-xs text-slate-400 mt-1">Paste profile URLs (any site). We’ll scan and find CSV/JSON links.</div>
+                <textarea
+                  value={profileLinksText}
+                  onChange={(e) => setProfileLinksText(e.target.value)}
+                  placeholder="Paste profile URLs..."
+                  className="mt-2 w-full border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500 h-24"
+                />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button onClick={scanProfileLinks} className="px-3 py-1.5 rounded bg-violet-500 text-slate-950 text-sm font-semibold hover:bg-violet-400">
+                    Scan links
+                  </button>
+                  <button
+                    onClick={importScannedDataFiles}
+                    disabled={scanFoundDataFiles.length === 0}
+                    className="px-3 py-1.5 rounded bg-slate-100 text-slate-950 text-sm font-semibold disabled:opacity-50"
+                  >
+                    Import found data files ({scanFoundDataFiles.length})
+                  </button>
                 </div>
-
-                <div className="border rounded-lg p-3">
-                  <div className="text-sm font-medium">Waves</div>
-                  <ul className="mt-2 text-sm text-slate-700 list-disc pl-4">
-                    {waves.length === 0 && <li className="list-none text-slate-500">No waves yet.</li>}
-                    {waves.map((wave, i) => (
-                      <li key={i}>
-                        {wave.action} on {wave.target} ({wave.actors.length} actors) @ {wave.windowStart}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-
-                <div className="border rounded-lg p-3 md:col-span-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-medium">Actor scorecards</div>
-                    <label className="text-sm text-slate-700">
-                      <input type="checkbox" className="mr-2" checked={showAllActors} onChange={(e) => setShowAllActors(e.target.checked)} />
-                      Show all actors
-                    </label>
+                {scanDetails.length > 0 && (
+                  <div className="mt-2 text-xs text-slate-200">
+                    <div className="font-medium">Scan results</div>
+                    <ul className="mt-1 list-disc pl-4">
+                      {scanDetails.map((p) => (
+                        <li key={p.url}>
+                          {p.ok ? (
+                            <>
+                              {p.url} — data files: {(p.discoveredDataFiles || []).length}
+                            </>
+                          ) : (
+                            <>
+                              {p.url} — <span className="text-red-400">{p.error}</span>
+                            </>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="mt-2 text-slate-400">
+                      Discovered links: {scanFoundLinks.length.toLocaleString()} · Data files: {scanFoundDataFiles.length.toLocaleString()}
+                    </div>
                   </div>
-                  <ul className="mt-2 text-sm text-slate-800 space-y-3 max-h-96 overflow-y-auto">
-                    {(showAllActors ? scorecards : scorecards.filter(s => s.sybilScore > settings.threshold))
-                      .slice()
-                      .sort((a, b) => b.sybilScore - a.sybilScore)
-                      .map((scorecard) => (
-                      <li key={scorecard.actor} className="border rounded p-3">
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="font-medium">{scorecard.actor}</div>
-                          <div className="text-sm">
-                            Score <span className="font-semibold">{scorecard.sybilScore.toFixed(2)}</span>
-                          </div>
-                        </div>
-                        <div className="mt-1 text-xs text-slate-600">
-                          Churn {scorecard.churnScore} · Coord {scorecard.coordinationScore.toFixed(2)} · Isolation {scorecard.clusterIsolationScore.toFixed(2)} · Diversity {scorecard.lowDiversityScore.toFixed(2)}
-                        </div>
-                        {scorecard.links.length > 0 && (
-                          <div className="mt-2 text-xs text-slate-700">
-                            Links ({scorecard.links.length}, diversity {scorecard.linkDiversity.toFixed(2)}):{' '}
-                            {scorecard.links.map((link) => (
-                              <a
-                                key={link}
-                                href={link}
-                                target="_blank"
-                                rel="noreferrer"
-                                className={scorecard.suspiciousLinks.includes(link) ? 'text-red-700 underline mr-2' : 'text-blue-700 underline mr-2'}
-                              >
-                                {link}
-                              </a>
-                            ))}
-                          </div>
-                        )}
-                        {scorecard.sharedLinks.length > 0 && (
-                          <div className="mt-1 text-xs text-slate-700">Shared links: {scorecard.sharedLinks.length}</div>
-                        )}
-                      </li>
-                    ))}
-                    {scorecards.length === 0 && <li className="text-slate-500">Run analysis to generate scorecards.</li>}
-                  </ul>
-                </div>
+                )}
               </div>
-            </section>
-          </div>
 
-          <aside className="space-y-4">
-            <section className="bg-white border rounded-lg p-4">
-              <h2 className="font-semibold">Settings</h2>
-              <p className="text-sm text-slate-600 mt-1">Tune thresholds and action semantics.</p>
-              <div className="mt-4 space-y-3">
-                <label className="text-sm text-slate-700 block">
+              <div className="border border-slate-800 bg-slate-950/30 rounded-lg p-3 md:col-span-2">
+                <div className="text-sm font-medium">Profile anomaly scan (no API)</div>
+                <div className="text-xs text-slate-400 mt-1">
+                  Paste profile URLs (e.g., Talent). We’ll fetch HTML, extract bio + links, and score anomalies.
+                </div>
+                <textarea
+                  value={profileScanText}
+                  onChange={(e) => setProfileScanText(e.target.value)}
+                  placeholder="https://talent.app/...\nhttps://github.com/..."
+                  className="mt-2 w-full border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500 h-24"
+                />
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button onClick={scanProfilesForAnomalies} className="px-3 py-1.5 rounded bg-cyan-500 text-slate-950 text-sm font-semibold hover:bg-cyan-400">
+                    Scan profiles
+                  </button>
+                  <div className="text-xs text-slate-400">Scanned: {profileScanResults.length}</div>
+                </div>
+                {profileScanResults.length > 0 && (
+                  <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {profileScanResults.slice(0, 8).map((p) => (
+                      <div key={p.inputUrl} className="border border-slate-800 bg-black/40 rounded-lg p-3">
+                        <div className="text-sm font-medium truncate">{p.actorId || p.inputUrl}</div>
+                        {!p.ok && <div className="text-xs text-red-400 mt-1">{p.error}</div>}
+                        {p.ok && (
+                          <>
+                            {p.title && <div className="text-xs text-slate-300 mt-1 truncate">{p.title}</div>}
+                            {p.riskScore !== undefined && (
+                              <div className="text-xs text-slate-300 mt-1">
+                                Risk <span className="font-semibold">{p.riskScore.toFixed(2)}</span> · Links {p.links?.length || 0} · Diversity{' '}
+                                {(p.linkDiversity ?? 0).toFixed(2)}
+                              </div>
+                            )}
+                            {p.reasons && p.reasons.length > 0 && (
+                              <ul className="mt-2 text-xs text-slate-200 list-disc pl-4">
+                                {p.reasons.slice(0, 4).map((r) => (
+                                  <li key={r}>{r}</li>
+                                ))}
+                              </ul>
+                            )}
+                            {p.suspiciousLinks && p.suspiciousLinks.length > 0 && (
+                              <div className="mt-2 text-xs">
+                                <div className="text-slate-400">Suspicious links</div>
+                                <div className="mt-1 flex flex-wrap gap-2">
+                                  {p.suspiciousLinks.slice(0, 4).map((u) => (
+                                    <a key={u} href={u} target="_blank" rel="noreferrer" className="underline text-red-300">
+                                      {u}
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <button
+                onClick={startAnalysis}
+                disabled={!fileUploaded || logs.length === 0}
+                className="px-3 py-2 rounded-md bg-emerald-500 text-slate-950 text-sm font-semibold disabled:opacity-50 hover:bg-emerald-400"
+              >
+                Run analysis
+              </button>
+              <div className="text-sm text-slate-300">
+                Loaded events: <span className="font-medium text-slate-100">{logs.length.toLocaleString()}</span>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {activeTab === 'analysis' && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card title="Settings" subtitle="Tune detection without changing code">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <label className="text-sm text-slate-200 block">
                   Threshold (0–1)
                   <input
                     type="number"
@@ -863,10 +1339,10 @@ export default function Home() {
                     step={0.05}
                     value={settings.threshold}
                     onChange={(e) => setSettings((s) => ({ ...s, threshold: Number.parseFloat(e.target.value) }))}
-                    className="mt-1 block border rounded px-2 py-1 w-full text-sm"
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
-                <label className="text-sm text-slate-700 block">
+                <label className="text-sm text-slate-200 block">
                   Min cluster size
                   <input
                     type="number"
@@ -874,10 +1350,10 @@ export default function Home() {
                     step={1}
                     value={settings.minClusterSize}
                     onChange={(e) => setSettings((s) => ({ ...s, minClusterSize: Math.max(2, Number.parseInt(e.target.value || '0')) }))}
-                    className="mt-1 block border rounded px-2 py-1 w-full text-sm"
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
-                <label className="text-sm text-slate-700 block">
+                <label className="text-sm text-slate-200 block">
                   Time bin (minutes)
                   <input
                     type="number"
@@ -885,21 +1361,32 @@ export default function Home() {
                     step={1}
                     value={settings.timeBinMinutes}
                     onChange={(e) => setSettings((s) => ({ ...s, timeBinMinutes: Math.max(1, Number.parseInt(e.target.value || '0')) }))}
-                    className="mt-1 block border rounded px-2 py-1 w-full text-sm"
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
-                <label className="text-sm text-slate-700 block">
-                  Wave min count (per bin)
+                <label className="text-sm text-slate-200 block">
+                  Wave min count
                   <input
                     type="number"
                     min={1}
                     step={1}
                     value={settings.waveMinCount}
                     onChange={(e) => setSettings((s) => ({ ...s, waveMinCount: Math.max(1, Number.parseInt(e.target.value || '0')) }))}
-                    className="mt-1 block border rounded px-2 py-1 w-full text-sm"
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
-                <label className="text-sm text-slate-700 block">
+                <label className="text-sm text-slate-200 block">
+                  Wave min actors
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={settings.waveMinActors}
+                    onChange={(e) => setSettings((s) => ({ ...s, waveMinActors: Math.max(1, Number.parseInt(e.target.value || '0')) }))}
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                  />
+                </label>
+                <label className="text-sm text-slate-200 block md:col-span-2">
                   Positive actions (graph edges)
                   <input
                     type="text"
@@ -913,10 +1400,10 @@ export default function Home() {
                           .filter(Boolean),
                       }))
                     }
-                    className="mt-1 block border rounded px-2 py-1 w-full text-sm"
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
-                <label className="text-sm text-slate-700 block">
+                <label className="text-sm text-slate-200 block md:col-span-2">
                   Churn actions
                   <input
                     type="text"
@@ -930,22 +1417,185 @@ export default function Home() {
                           .filter(Boolean),
                       }))
                     }
-                    className="mt-1 block border rounded px-2 py-1 w-full text-sm"
+                    className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
               </div>
-            </section>
+              <div className="mt-4">
+                <button
+                  onClick={startAnalysis}
+                  disabled={!fileUploaded || logs.length === 0}
+                  className="px-3 py-2 rounded-md bg-emerald-500 text-slate-950 text-sm font-semibold disabled:opacity-50 hover:bg-emerald-400"
+                >
+                  Run analysis
+                </button>
+              </div>
+            </Card>
 
-            <section className="bg-white border rounded-lg p-4">
-              <h2 className="font-semibold">What to analyze next</h2>
-              <ul className="mt-2 text-sm text-slate-700 list-disc pl-4">
-                <li>GitHub: repo stargazers (timestamped)</li>
-                <li>Farcaster/Base/Talent: add connectors (next)</li>
-                <li>Upload your own action logs (best coverage)</li>
+            <Card title="How scoring works" subtitle="Explainable, human-readable signals">
+              <ul className="text-sm text-slate-200 list-disc pl-4 space-y-1">
+                <li>Coordination: actor activity in detected “wave” bins</li>
+                <li>Churn: unfollow/unstar counts</li>
+                <li>Cluster isolation: low external connections within components</li>
+                <li>Low diversity: many actions on few targets</li>
+                <li>Profile: suspicious/shared links + follower/following ratio</li>
+                <li>Extra: reciprocity, repeated bios, new-account flag</li>
               </ul>
-            </section>
-          </aside>
-        </div>
+              <p className="text-xs text-slate-400 mt-3">
+                Tip: start with a higher threshold (e.g. 0.7) while tuning to reduce false positives.
+              </p>
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'graph' && (
+          <Card title="Graph" subtitle="Red nodes are above your threshold">
+            <div style={{ width: '100%', height: '640px' }}>
+              <CytoscapeComponent
+                elements={elements}
+                style={{ width: '100%', height: '100%' }}
+                stylesheet={[
+                  {
+                    selector: 'node',
+                    style: {
+                      'background-color': (ele: NodeSingular) => {
+                        const scorecard = scorecards.find(s => s.actor === ele.data('id'));
+                        return scorecard && scorecard.sybilScore > settings.threshold ? 'rgb(220 38 38)' : 'rgb(37 99 235)';
+                      },
+                      label: 'data(label)',
+                      'text-valign': 'center',
+                      'text-halign': 'center',
+                      'font-size': '10px',
+                      color: 'rgb(226 232 240)',
+                      'text-outline-color': 'rgb(2 6 23)',
+                      'text-outline-width': 1,
+                    },
+                  },
+                  {
+                    selector: 'edge[type="interaction"]',
+                    style: {
+                      width: 2,
+                      'line-color': 'rgb(52 211 153)',
+                    },
+                  },
+                ]}
+                layout={{ name: 'cose' }}
+              />
+            </div>
+          </Card>
+        )}
+
+        {activeTab === 'results' && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card title="Clusters" subtitle="Connected components above your minimum size">
+              <ul className="text-sm text-slate-200 list-disc pl-4 space-y-1">
+                {clusters.length === 0 && <li className="list-none text-slate-500">No clusters yet.</li>}
+                {clusters.map((c) => (
+                  <li key={c.clusterId}>
+                    #{c.clusterId}: {c.members.length} members · density {c.density.toFixed(2)} · conductance {c.conductance.toFixed(2)} · external edges {c.externalEdges}
+                  </li>
+                ))}
+              </ul>
+            </Card>
+
+            <Card title="Waves" subtitle="Bursts in fixed time bins">
+              <ul className="text-sm text-slate-200 list-disc pl-4 space-y-1">
+                {waves.length === 0 && <li className="list-none text-slate-500">No waves yet.</li>}
+                {waves.map((w, i) => (
+                  <li key={i}>
+                    {w.windowStart}: {w.action} on {w.target} · {w.actors.length} actors · z {w.zScore.toFixed(2)}
+                  </li>
+                ))}
+              </ul>
+            </Card>
+
+            <Card title="Actor scorecards" subtitle="Searchable, explainable reasons">
+              <div className="flex flex-col md:flex-row md:items-center gap-2 md:justify-between">
+                <label className="text-sm text-slate-200">
+                  <input type="checkbox" className="mr-2" checked={showAllActors} onChange={(e) => setShowAllActors(e.target.checked)} />
+                  Show all actors
+                </label>
+                <input
+                  value={actorSearch}
+                  onChange={(e) => setActorSearch(e.target.value)}
+                  placeholder="Search actor..."
+                  className="border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <ul className="mt-3 space-y-3 max-h-[720px] overflow-y-auto">
+                {(showAllActors ? scorecards : flaggedScorecards)
+                  .filter((s) => (actorSearch.trim() ? s.actor.toLowerCase().includes(actorSearch.trim().toLowerCase()) : true))
+                  .slice()
+                  .sort((a, b) => b.sybilScore - a.sybilScore)
+                  .map((s) => (
+                    <li key={s.actor} className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="font-medium">{s.actor}</div>
+                        <div className="text-sm">
+                          Score <span className="font-semibold">{s.sybilScore.toFixed(2)}</span>
+                        </div>
+                      </div>
+                      <div className="mt-1 text-xs text-slate-400">
+                        Churn {s.churnScore} · Coord {s.coordinationScore.toFixed(2)} · Burst {s.burstRate.toFixed(2)} · Reciprocity {s.reciprocalRate.toFixed(2)} · Bio {s.bioSimilarityScore.toFixed(2)} · Handle {s.handlePatternScore.toFixed(2)} · Phish {s.phishingLinkScore.toFixed(2)} · New {s.newAccountScore}
+                      </div>
+                      {s.reasons.length > 0 && (
+                        <div className="mt-2 text-xs text-slate-200">
+                          <div className="font-medium">Why flagged</div>
+                          <ul className="mt-1 list-disc pl-4">
+                            {s.reasons.slice(0, 6).map((r) => (
+                              <li key={r}>{r}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {s.links.length > 0 && (
+                        <div className="mt-2 text-xs text-slate-200">
+                          Links ({s.links.length}, diversity {s.linkDiversity.toFixed(2)}):{' '}
+                          {s.links.slice(0, 10).map((link) => (
+                            <a
+                              key={link}
+                              href={link}
+                              target="_blank"
+                              rel="noreferrer"
+                              className={s.suspiciousLinks.includes(link) ? 'text-red-700 underline mr-2' : 'text-blue-700 underline mr-2'}
+                            >
+                              {link}
+                            </a>
+                          ))}
+                          {s.links.length > 10 && <span className="text-slate-500">(+{s.links.length - 10} more)</span>}
+                        </div>
+                      )}
+                    </li>
+                  ))}
+                {scorecards.length === 0 && <li className="text-slate-500">Run analysis to generate scorecards.</li>}
+              </ul>
+            </Card>
+          </div>
+        )}
+
+        {activeTab === 'evidence' && (
+          <Card title="Evidence pack" subtitle="Copy/paste or download JSON for review/reporting">
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={exportEvidence} disabled={logs.length === 0} className="px-3 py-2 rounded-md bg-slate-100 text-slate-950 text-sm font-semibold disabled:opacity-50">
+                Download JSON
+              </button>
+              <button
+                onClick={async () => {
+                  await navigator.clipboard.writeText(evidenceJson);
+                  setSourceStatus('Copied evidence JSON to clipboard');
+                }}
+                disabled={logs.length === 0}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-slate-950/40 text-sm text-slate-200 disabled:opacity-50"
+              >
+                Copy JSON
+              </button>
+              <div className="text-sm text-slate-300">
+                Flagged: <span className="font-medium text-slate-100">{flaggedScorecards.length.toLocaleString()}</span>
+              </div>
+            </div>
+            <pre className="mt-4 bg-black/50 text-slate-100 border border-slate-800 rounded-lg p-3 overflow-auto text-xs max-h-[720px]">{evidenceJson}</pre>
+          </Card>
+        )}
       </main>
     </div>
   );

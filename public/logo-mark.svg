@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="Sybil Shield mark">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.55" stop-color="#a78bfa"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+  <path d="M100 10 L176 54 L176 146 L100 190 L24 146 L24 54 Z" fill="none" stroke="url(#g)" stroke-width="12"/>
+  <circle cx="100" cy="62" r="10" fill="#22d3ee"/>
+  <circle cx="65" cy="104" r="10" fill="#a78bfa"/>
+  <circle cx="135" cy="110" r="10" fill="#22c55e"/>
+  <circle cx="100" cy="145" r="10" fill="#e5e7eb" opacity="0.9"/>
+  <path d="M100 62 L65 104 L100 145 L135 110 Z" fill="none" stroke="#e5e7eb" stroke-width="6" opacity="0.75"/>
+</svg>
+

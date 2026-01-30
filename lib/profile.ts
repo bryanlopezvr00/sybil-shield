@@ -49,6 +49,8 @@ export function isSuspiciousDomain(url: string): boolean {
   try {
     const hostname = new URL(url).hostname.toLowerCase();
     const domain = hostname.startsWith('www.') ? hostname.slice(4) : hostname;
+    if (domain.startsWith('xn--')) return true; // punycode
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(domain)) return true; // IP literal
     return suspiciousDomains.some((blocked) => domain === blocked || domain.endsWith(`.${blocked}`));
   } catch {
     return false;
