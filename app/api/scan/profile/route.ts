@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { computeSharedLinksByActor, isSuspiciousDomain, linkDiversityScore, normalizeLinks, updateProfileAnomalyScore } from '../../../../lib/profile';
 import { extractUrlsFromText, resolveUrlVariants } from '../../../../lib/urlResolvers';
 import { handleStem, handleShape, isLikelyPhishingUrl } from '../../../../lib/scam';
+import { rateLimit } from '../../../../lib/rateLimit';
 
 type ScanRequestBody = {
   urls?: unknown;
@@ -110,6 +111,9 @@ function inferActorIdFromUrl(urlStr: string): string {
 }
 
 export async function POST(req: Request) {
+  const rl = rateLimit(req, { key: 'scan_profile', max: 15, windowMs: 60_000 });
+  if (!rl.allowed) return NextResponse.json({ error: 'Rate limited. Try again later.' }, { status: 429 });
+
   const body = (await req.json().catch(() => ({}))) as ScanRequestBody;
   const inputs = Array.isArray(body.urls) ? body.urls.map(String) : [];
   const expanded = inputs.flatMap((t) => extractUrlsFromText(t));
@@ -229,4 +233,3 @@ export async function POST(req: Request) {
     profiles: enriched,
   });
 }
-

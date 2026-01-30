@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { extractUrlsFromText, resolveUrlVariants } from '../../../../lib/urlResolvers';
+import { rateLimit } from '../../../../lib/rateLimit';
 
 type ScanRequestBody = {
   urls?: unknown;
@@ -90,6 +91,9 @@ async function fetchTextWithLimit(url: string): Promise<{ contentType: string; t
 }
 
 export async function POST(req: Request) {
+  const rl = rateLimit(req, { key: 'scan_links', max: 20, windowMs: 60_000 });
+  if (!rl.allowed) return NextResponse.json({ error: 'Rate limited. Try again later.' }, { status: 429 });
+
   const body = (await req.json().catch(() => ({}))) as ScanRequestBody;
   const urls = Array.isArray(body.urls) ? body.urls.map(String) : [];
   const expandedInputs = urls.flatMap((u) => extractUrlsFromText(u));

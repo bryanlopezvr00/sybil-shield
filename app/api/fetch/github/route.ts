@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { rateLimit } from '../../../../lib/rateLimit';
 
 type GithubStargazer = {
   starred_at?: string;
@@ -24,6 +25,9 @@ async function fetchAllPages<T>(url: string, init: RequestInit, maxPages: number
 }
 
 export async function GET(req: Request) {
+  const rl = rateLimit(req, { key: 'fetch_github', max: 30, windowMs: 60_000 });
+  if (!rl.allowed) return NextResponse.json({ error: 'Rate limited. Try again later.' }, { status: 429 });
+
   const { searchParams } = new URL(req.url);
   const repo = (searchParams.get('repo') || '').trim(); // owner/name
   const maxPages = Math.min(Math.max(Number.parseInt(searchParams.get('maxPages') || '3', 10) || 3, 1), 20);
@@ -60,4 +64,3 @@ export async function GET(req: Request) {
     logs,
   });
 }
-

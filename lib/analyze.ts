@@ -37,6 +37,7 @@ export type WaveResult = {
   target: string;
   actors: string[];
   zScore: number;
+  method?: 'bin' | 'window';
 };
 
 export type AnalysisSettings = {
@@ -49,6 +50,13 @@ export type AnalysisSettings = {
   churnActions: string[];
   rapidActionsPerMinuteThreshold: number;
   entropyMinTotalActions: number;
+  burstWindowSeconds: number;
+  burstMinCount: number;
+  burstMinActors: number;
+  velocityWindowSeconds: number;
+  velocityMaxActionsInWindow: number;
+  sessionGapMinutes: number;
+  actionNgramSize: number;
 };
 
 export type ActorScorecard = {
@@ -75,8 +83,20 @@ export type ActorScorecard = {
   betweenness: number;
   maxActionsPerMinute: number;
   rapidActionScore: number;
+  maxActionsPerVelocityWindow: number;
+  maxActionsPerSecond: number;
+  velocityScore: number;
   targetEntropy: number; // normalized [0,1]
   lowEntropyScore: number; // 1 - targetEntropy
+  hourEntropy: number; // normalized [0,1]
+  activeHours: number;
+  circadianScore: number;
+  actionSequenceRepeatScore: number;
+  topActionNgram: string;
+  topActionNgramCount: number;
+  avgSessionMinutes: number;
+  avgSessionGapMinutes: number;
+  maxSessionGapMinutes: number;
   sharedWallets: string[];
   crossAppPlatforms: string[];
   sessionCount: number;
@@ -269,11 +289,22 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
             target,
             actors: Array.from(info.actors),
             zScore: info.count / Math.max(1, settings.waveMinCount),
+            method: 'bin',
           });
         }
       });
     });
   });
+
+  // Sliding-window bursts (avoids missing coordination when actors straddle fixed bins)
+  const burstWindowMs = Math.max(1, settings.burstWindowSeconds) * 1000;
+  const burstResult = detectWindowBursts({
+    logs,
+    windowMs: burstWindowMs,
+    minCount: Math.max(1, settings.burstMinCount),
+    minActors: Math.max(1, settings.burstMinActors),
+  });
+  burstResult.bursts.forEach((b) => waves.push(b));
   report({ stage: 'waves', pct: 60 });
 
   // Actor stats for scoring
@@ -392,6 +423,12 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       });
     });
   });
+  // include sliding window bursts in "burstActions"
+  burstResult.burstKeysByActor.forEach((keys, actor) => {
+    if (!waveBinsByActor.has(actor)) waveBinsByActor.set(actor, new Set());
+    const s = waveBinsByActor.get(actor)!;
+    keys.forEach((k) => s.add(k));
+  });
   Object.keys(actorStats).forEach((actor) => {
     actorStats[actor].burstActions = waveBinsByActor.get(actor)?.size ?? 0;
   });
@@ -401,8 +438,15 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   // Additional mini-app detections
   const sharedWallets = detectSharedWallets(logs);
   const crossAppLinks = detectCrossAppLinking(logs);
-  const sessionAnomalies = detectSessionAnomalies(logs);
+  const sessionMetrics = detectSessionMetrics(logs, Math.max(1, settings.sessionGapMinutes) * 60 * 1000);
   const fraudulentTx = detectFraudulentTransactions(logs);
+  const velocityByActor = computeVelocityByActor(
+    logs,
+    Math.max(1, settings.velocityWindowSeconds) * 1000,
+    Math.max(1, settings.velocityMaxActionsInWindow),
+  );
+  const circadianByActor = computeCircadianByActor(logs);
+  const ngramByActor = computeActionNgramByActor(logs, Math.min(Math.max(2, settings.actionNgramSize), 5));
 
   const scorecards: ActorScorecard[] = Object.values(actorStats).map((stats) => {
     const coordinationScore = stats.totalActions > 0 ? Math.min(stats.burstActions / stats.totalActions, 1) : 0;
@@ -446,12 +490,36 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     const ent = targetEntropy.get(stats.actor) ?? 0;
     const lowEntropyScore = 1 - ent;
 
+    const velocity = velocityByActor.get(stats.actor) ?? { maxInWindow: 0, maxPerSecond: 0, velocityScore: 0 };
+    const circadian = circadianByActor.get(stats.actor) ?? { hourEntropy: 0, activeHours: 0, circadianScore: 0 };
+    const ngram = ngramByActor.get(stats.actor) ?? { repeatScore: 0, topNgram: '', topCount: 0 };
+
+    const session = sessionMetrics.get(stats.actor) ?? {
+      sessionCount: 0,
+      avgSessionMinutes: 0,
+      avgGapMinutes: 0,
+      maxGapMinutes: 0,
+      bottySessionScore: 0,
+    };
+
     // Extra mini-app style risk boosters (kept additive + clamped for backwards compatibility)
     const sharedWalletScore = (sharedWallets.get(stats.actor)?.length ?? 0) > 0 ? 1 : 0;
     const crossAppScore = (crossAppLinks.get(stats.actor)?.length ?? 0) > 1 ? 0.5 : 0;
-    const sessionScore = Math.min((sessionAnomalies.get(stats.actor) ?? 0) / 10, 1);
+    const sessionScore = session.bottySessionScore;
     const fraudScore = fraudulentTx.get(stats.actor) ?? 0;
-    const sybilScore = Math.min(baseSybilScore + 0.10 * rapidActionScore + 0.05 * (stats.totalActions >= settings.entropyMinTotalActions ? lowEntropyScore : 0) + 0.05 * sharedWalletScore + 0.05 * crossAppScore + 0.05 * sessionScore + 0.05 * fraudScore, 1);
+    const sybilScore = Math.min(
+      baseSybilScore +
+        0.10 * rapidActionScore +
+        0.05 * (stats.totalActions >= settings.entropyMinTotalActions ? lowEntropyScore : 0) +
+        0.05 * velocity.velocityScore +
+        0.03 * ngram.repeatScore +
+        0.03 * circadian.circadianScore +
+        0.05 * sharedWalletScore +
+        0.05 * crossAppScore +
+        0.05 * sessionScore +
+        0.05 * fraudScore,
+      1,
+    );
 
     const reasons: string[] = [];
     if (sybilScore > settings.threshold) reasons.push(`Score ${sybilScore.toFixed(2)} ≥ threshold ${settings.threshold.toFixed(2)}`);
@@ -468,10 +536,13 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     if ((pagerank.get(stats.actor) || 0) > 0.01) reasons.push(`High PageRank (${(pagerank.get(stats.actor) || 0).toFixed(3)})`);
     if ((betweenness.get(stats.actor) || 0) > 0.05) reasons.push(`Bridge-like betweenness (${(betweenness.get(stats.actor) || 0).toFixed(2)})`);
     if (maxApm >= settings.rapidActionsPerMinuteThreshold) reasons.push(`Rapid actions (${maxApm}/min)`);
+    if (velocity.velocityScore >= 0.7) reasons.push(`High velocity (${velocity.maxInWindow} in ${Math.max(1, settings.velocityWindowSeconds)}s)`);
+    if (ngram.repeatScore >= 0.7 && ngram.topNgram) reasons.push(`Script-like sequence (${ngram.topNgram})`);
+    if (circadian.circadianScore >= 0.8) reasons.push(`Unnatural circadian pattern (active hours ${circadian.activeHours})`);
     if (stats.totalActions >= settings.entropyMinTotalActions && lowEntropyScore >= 0.7) reasons.push(`Low target entropy (${ent.toFixed(2)})`);
-    if (sharedWallets.get(stats.actor)?.length) reasons.push(`Shared wallets (${sharedWallets.get(stats.actor)!.length})`);
+    if (sharedWallets.get(stats.actor)?.length) reasons.push(`Shared funders (${sharedWallets.get(stats.actor)!.length})`);
     if (crossAppLinks.get(stats.actor)?.length) reasons.push(`Cross-app activity (${crossAppLinks.get(stats.actor)!.join(', ')})`);
-    if ((sessionAnomalies.get(stats.actor) ?? 0) > 5) reasons.push(`High session count (${sessionAnomalies.get(stats.actor)})`);
+    if (session.sessionCount > 5) reasons.push(`High session count (${session.sessionCount})`);
     if ((fraudulentTx.get(stats.actor) ?? 0) > 0.5) reasons.push(`Fraudulent transaction patterns (${(fraudulentTx.get(stats.actor) ?? 0).toFixed(2)})`);
 
     return {
@@ -498,11 +569,23 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       betweenness: betweenness.get(stats.actor) || 0,
       maxActionsPerMinute: maxApm,
       rapidActionScore,
+      maxActionsPerVelocityWindow: velocity.maxInWindow,
+      maxActionsPerSecond: velocity.maxPerSecond,
+      velocityScore: velocity.velocityScore,
       targetEntropy: ent,
       lowEntropyScore,
+      hourEntropy: circadian.hourEntropy,
+      activeHours: circadian.activeHours,
+      circadianScore: circadian.circadianScore,
+      actionSequenceRepeatScore: ngram.repeatScore,
+      topActionNgram: ngram.topNgram,
+      topActionNgramCount: ngram.topCount,
+      avgSessionMinutes: session.avgSessionMinutes,
+      avgSessionGapMinutes: session.avgGapMinutes,
+      maxSessionGapMinutes: session.maxGapMinutes,
       sharedWallets: sharedWallets.get(stats.actor) ?? [],
       crossAppPlatforms: crossAppLinks.get(stats.actor) ?? [],
-      sessionCount: sessionAnomalies.get(stats.actor) ?? 0,
+      sessionCount: session.sessionCount,
       fraudTxScore: fraudulentTx.get(stats.actor) ?? 0,
       reasons,
     };
@@ -514,23 +597,28 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
 }
 
 export function detectSharedWallets(logs: LogEntry[]): Map<string, string[]> {
-  const walletToActors = new Map<string, Set<string>>();
-  logs.forEach(log => {
-    if (log.meta && typeof log.meta === 'string' && log.meta.startsWith('0x')) { // assume wallet address
-      if (!walletToActors.has(log.meta)) walletToActors.set(log.meta, new Set());
-      walletToActors.get(log.meta)!.add(log.actor);
-    }
+  // Detect "shared funders" across wallet actors (common funding sources used to seed multiple wallets).
+  const isAddr = (x: string) => /^0x[a-fA-F0-9]{40}$/.test(x);
+
+  const funderToTargets = new Map<string, Set<string>>();
+  logs.forEach((log) => {
+    if (log.action !== 'transfer') return;
+    if (!isAddr(log.actor) || !isAddr(log.target)) return;
+    const funder = log.actor.toLowerCase();
+    const target = log.target.toLowerCase();
+    if (!funderToTargets.has(funder)) funderToTargets.set(funder, new Set());
+    funderToTargets.get(funder)!.add(target);
   });
-  const actorToSharedWallets = new Map<string, string[]>();
-  walletToActors.forEach((actors, wallet) => {
-    if (actors.size > 1) {
-      actors.forEach(actor => {
-        if (!actorToSharedWallets.has(actor)) actorToSharedWallets.set(actor, []);
-        actorToSharedWallets.get(actor)!.push(wallet);
-      });
-    }
+
+  const walletToSharedFunders = new Map<string, string[]>();
+  funderToTargets.forEach((targets, funder) => {
+    if (targets.size < 2) return;
+    targets.forEach((wallet) => {
+      if (!walletToSharedFunders.has(wallet)) walletToSharedFunders.set(wallet, []);
+      walletToSharedFunders.get(wallet)!.push(funder);
+    });
   });
-  return actorToSharedWallets;
+  return walletToSharedFunders;
 }
 
 export function detectCrossAppLinking(logs: LogEntry[]): Map<string, string[]> {
@@ -549,28 +637,278 @@ export function detectCrossAppLinking(logs: LogEntry[]): Map<string, string[]> {
 }
 
 export function detectSessionAnomalies(logs: LogEntry[], sessionThresholdMs: number = 300000): Map<string, number> {
-  const actorSessions = new Map<string, number[]>();
-  logs.forEach(log => {
+  const metrics = detectSessionMetrics(logs, sessionThresholdMs);
+  const out = new Map<string, number>();
+  metrics.forEach((m, actor) => out.set(actor, m.sessionCount));
+  return out;
+}
+
+export function detectSessionMetrics(
+  logs: LogEntry[],
+  sessionThresholdMs: number = 300000,
+): Map<
+  string,
+  { sessionCount: number; avgSessionMinutes: number; avgGapMinutes: number; maxGapMinutes: number; bottySessionScore: number }
+> {
+  const actorTimes = new Map<string, number[]>();
+  logs.forEach((log) => {
     const ts = new Date(log.timestamp).getTime();
     if (!Number.isFinite(ts)) return;
-    if (!actorSessions.has(log.actor)) actorSessions.set(log.actor, []);
-    actorSessions.get(log.actor)!.push(ts);
+    if (!actorTimes.has(log.actor)) actorTimes.set(log.actor, []);
+    actorTimes.get(log.actor)!.push(ts);
   });
-  const sessionScores = new Map<string, number>();
-  actorSessions.forEach((times, actor) => {
+
+  const out = new Map<
+    string,
+    { sessionCount: number; avgSessionMinutes: number; avgGapMinutes: number; maxGapMinutes: number; bottySessionScore: number }
+  >();
+
+  actorTimes.forEach((times, actor) => {
+    if (times.length === 0) return;
     times.sort((a, b) => a - b);
-    let sessions = 0;
-    let currentSessionStart = times[0];
+    const sessionDurations: number[] = [];
+    const gaps: number[] = [];
+
+    let sessionStart = times[0];
+    let sessionEnd = times[0];
     for (let i = 1; i < times.length; i++) {
-      if (times[i] - times[i - 1] > sessionThresholdMs) {
-        sessions++;
-        currentSessionStart = times[i];
+      const gap = times[i] - times[i - 1];
+      if (gap > sessionThresholdMs) {
+        sessionDurations.push(sessionEnd - sessionStart);
+        gaps.push(gap);
+        sessionStart = times[i];
+        sessionEnd = times[i];
+      } else {
+        sessionEnd = times[i];
       }
     }
-    sessions++; // last session
-    sessionScores.set(actor, sessions);
+    sessionDurations.push(sessionEnd - sessionStart);
+
+    const sessionCount = sessionDurations.length;
+    const avgSessionMs = sessionDurations.reduce((a, b) => a + b, 0) / Math.max(1, sessionDurations.length);
+    const avgGapMs = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
+    const maxGapMs = gaps.length ? Math.max(...gaps) : 0;
+
+    // Botty if many sessions and sessions are very short (e.g., scripted “tap/claim” bursts).
+    const shortSessionScore = avgSessionMs <= 60_000 ? 1 : avgSessionMs <= 5 * 60_000 ? 0.5 : 0;
+    const manySessionScore = Math.min(sessionCount / 10, 1);
+    const bottySessionScore = Math.min(shortSessionScore * manySessionScore, 1);
+
+    out.set(actor, {
+      sessionCount,
+      avgSessionMinutes: avgSessionMs / 60_000,
+      avgGapMinutes: avgGapMs / 60_000,
+      maxGapMinutes: maxGapMs / 60_000,
+      bottySessionScore,
+    });
   });
-  return sessionScores;
+
+  return out;
+}
+
+function computeVelocityByActor(
+  logs: LogEntry[],
+  windowMs: number,
+  velocityMaxActionsInWindow: number,
+): Map<string, { maxInWindow: number; maxPerSecond: number; velocityScore: number }> {
+  const actorTimes = new Map<string, number[]>();
+  logs.forEach((log) => {
+    const ts = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(ts)) return;
+    if (!actorTimes.has(log.actor)) actorTimes.set(log.actor, []);
+    actorTimes.get(log.actor)!.push(ts);
+  });
+
+  const out = new Map<string, { maxInWindow: number; maxPerSecond: number; velocityScore: number }>();
+  actorTimes.forEach((times, actor) => {
+    times.sort((a, b) => a - b);
+    let left = 0;
+    let maxCount = 0;
+    for (let right = 0; right < times.length; right++) {
+      while (times[right] - times[left] > windowMs) left++;
+      const count = right - left + 1;
+      if (count > maxCount) maxCount = count;
+    }
+    const windowSeconds = Math.max(1, windowMs / 1000);
+    const maxPerSecond = maxCount / windowSeconds;
+    const threshold = Math.max(1, velocityMaxActionsInWindow);
+    const velocityScore = maxCount >= threshold ? Math.min((maxCount - threshold) / threshold, 1) : 0;
+    out.set(actor, { maxInWindow: maxCount, maxPerSecond, velocityScore });
+  });
+  return out;
+}
+
+function computeCircadianByActor(logs: LogEntry[]): Map<string, { hourEntropy: number; activeHours: number; circadianScore: number }> {
+  const perActorHours = new Map<string, number[]>();
+  logs.forEach((log) => {
+    const ts = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(ts)) return;
+    const h = new Date(ts).getUTCHours();
+    if (!perActorHours.has(log.actor)) perActorHours.set(log.actor, []);
+    perActorHours.get(log.actor)!.push(h);
+  });
+
+  const out = new Map<string, { hourEntropy: number; activeHours: number; circadianScore: number }>();
+  perActorHours.forEach((hours, actor) => {
+    const counts = new Array<number>(24).fill(0);
+    for (const h of hours) counts[h] += 1;
+    const activeHours = counts.filter((c) => c > 0).length;
+    const total = hours.length;
+    let H = 0;
+    for (const c of counts) {
+      if (c === 0) continue;
+      const p = c / total;
+      H += -p * Math.log(p);
+    }
+    const Hmax = Math.log(24) || 1;
+    const hourEntropy = Math.max(0, Math.min(H / Hmax, 1));
+
+    // Two “odd” regimes:
+    // - very wide activity (near 24h) at high volume can indicate automation
+    // - very narrow activity (1-2h) at high volume can indicate coordination farms
+    const wide = activeHours >= 20 && total >= 200 ? 1 : 0;
+    const narrow = activeHours <= 2 && total >= 100 ? 0.8 : 0;
+    const circadianScore = Math.max(wide, narrow);
+
+    out.set(actor, { hourEntropy, activeHours, circadianScore });
+  });
+  return out;
+}
+
+function computeActionNgramByActor(logs: LogEntry[], n: number): Map<string, { repeatScore: number; topNgram: string; topCount: number }> {
+  const perActor = new Map<string, Array<{ ts: number; action: string }>>();
+  logs.forEach((log) => {
+    const ts = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(ts)) return;
+    if (!perActor.has(log.actor)) perActor.set(log.actor, []);
+    perActor.get(log.actor)!.push({ ts, action: String(log.action || '') });
+  });
+
+  const out = new Map<string, { repeatScore: number; topNgram: string; topCount: number }>();
+  perActor.forEach((rows, actor) => {
+    rows.sort((a, b) => a.ts - b.ts);
+    const seq = rows.map((r) => r.action).filter(Boolean);
+    if (seq.length < n + 2) {
+      out.set(actor, { repeatScore: 0, topNgram: '', topCount: 0 });
+      return;
+    }
+    const counts = new Map<string, number>();
+    for (let i = 0; i <= seq.length - n; i++) {
+      const gram = seq.slice(i, i + n).join('→');
+      counts.set(gram, (counts.get(gram) || 0) + 1);
+    }
+    let topNgram = '';
+    let topCount = 0;
+    counts.forEach((c, g) => {
+      if (c > topCount) {
+        topCount = c;
+        topNgram = g;
+      }
+    });
+    const totalNgrams = Math.max(1, seq.length - n + 1);
+    const repeatScore = Math.min(topCount / totalNgrams, 1);
+    out.set(actor, { repeatScore, topNgram, topCount });
+  });
+  return out;
+}
+
+function detectWindowBursts(input: {
+  logs: LogEntry[];
+  windowMs: number;
+  minCount: number;
+  minActors: number;
+}): { bursts: WaveResult[]; burstKeysByActor: Map<string, Set<string>> } {
+  const { logs, windowMs, minCount, minActors } = input;
+  const byKey = new Map<string, Array<{ ts: number; actor: string; action: string; target: string }>>();
+  for (const log of logs) {
+    const ts = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(ts)) continue;
+    const action = String(log.action || '');
+    const target = String(log.target || '');
+    if (!action || !target) continue;
+    const key = `${action}::${target}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key)!.push({ ts, actor: log.actor, action, target });
+  }
+
+  const bursts: WaveResult[] = [];
+  const burstKeysByActor = new Map<string, Set<string>>();
+  const durationMs = (() => {
+    const times = logs.map((l) => new Date(l.timestamp).getTime()).filter((t) => Number.isFinite(t));
+    if (times.length < 2) return windowMs;
+    return Math.max(1, Math.max(...times) - Math.min(...times));
+  })();
+
+  byKey.forEach((events, key) => {
+    if (events.length < minCount) return;
+    events.sort((a, b) => a.ts - b.ts);
+
+    let left = 0;
+    const actorCounts = new Map<string, number>();
+    let best = { start: events[0].ts, count: 0, actors: new Set<string>() as Set<string> };
+
+    for (let right = 0; right < events.length; right++) {
+      const ev = events[right];
+      actorCounts.set(ev.actor, (actorCounts.get(ev.actor) || 0) + 1);
+
+      while (events[right].ts - events[left].ts > windowMs) {
+        const a = events[left].actor;
+        const next = (actorCounts.get(a) || 0) - 1;
+        if (next <= 0) actorCounts.delete(a);
+        else actorCounts.set(a, next);
+        left++;
+      }
+
+      const count = right - left + 1;
+      const uniqueActors = actorCounts.size;
+      if (count > best.count && count >= minCount && uniqueActors >= minActors) {
+        best = { start: events[left].ts, count, actors: new Set(actorCounts.keys()) };
+      }
+    }
+
+    if (best.count < minCount || best.actors.size < minActors) return;
+    const [action, target] = key.split('::');
+
+    const ratePerMs = events.length / durationMs;
+    const expected = ratePerMs * windowMs;
+    const z = (best.count - expected) / Math.sqrt(Math.max(1e-6, expected));
+    if (!Number.isFinite(z) || z < 2.5) return;
+
+    const windowStart = new Date(best.start).toISOString();
+    const windowEnd = new Date(best.start + windowMs).toISOString();
+    const burstKey = `${windowStart}:${action}:${target}:window`;
+
+    bursts.push({
+      windowStart,
+      windowEnd,
+      action,
+      target,
+      actors: Array.from(best.actors),
+      zScore: z,
+      method: 'window',
+    });
+
+    best.actors.forEach((actor) => {
+      if (!burstKeysByActor.has(actor)) burstKeysByActor.set(actor, new Set());
+      burstKeysByActor.get(actor)!.add(burstKey);
+    });
+  });
+
+  // Keep top bursts (avoid UI overwhelm)
+  bursts.sort((a, b) => b.zScore - a.zScore);
+  const trimmed = bursts.slice(0, 250);
+
+  // Trim actor burst keys to those within top bursts
+  const allowed = new Set(trimmed.map((b) => `${b.windowStart}:${b.action}:${b.target}:window`));
+  burstKeysByActor.forEach((keys, actor) => {
+    const next = new Set<string>();
+    keys.forEach((k) => {
+      if (allowed.has(k)) next.add(k);
+    });
+    burstKeysByActor.set(actor, next);
+  });
+
+  return { bursts: trimmed, burstKeysByActor };
 }
 
 export function detectFraudulentTransactions(logs: LogEntry[]): Map<string, number> {

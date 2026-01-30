@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { rateLimit } from '../../../../lib/rateLimit';
 
 type LogEntry = {
   timestamp: string;
@@ -152,6 +153,9 @@ function dedupeLogs(logs: RpcLog[]): RpcLog[] {
 }
 
 export async function GET(req: Request) {
+  const rl = rateLimit(req, { key: 'fetch_base', max: 30, windowMs: 60_000 });
+  if (!rl.allowed) return NextResponse.json({ error: 'Rate limited. Try again later.' }, { status: 429 });
+
   const { searchParams } = new URL(req.url);
   const rpcUrlParam = searchParams.get('rpcUrl');
   const normalizedRpcUrlParam = rpcUrlParam ? normalizePublicHttpsUrlInput(rpcUrlParam) : null;

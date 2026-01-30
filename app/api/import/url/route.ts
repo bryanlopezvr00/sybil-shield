@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import Papa from 'papaparse';
 import { extractUrlsFromText, resolveUrlVariants } from '../../../../lib/urlResolvers';
+import { rateLimit } from '../../../../lib/rateLimit';
 
 type ImportRequestBody = {
   urls?: unknown;
@@ -122,6 +123,9 @@ function parseJson(text: string): LogEntry[] {
 }
 
 export async function POST(req: Request) {
+  const rl = rateLimit(req, { key: 'import_url', max: 20, windowMs: 60_000 });
+  if (!rl.allowed) return NextResponse.json({ error: 'Rate limited. Try again later.' }, { status: 429 });
+
   const body = (await req.json().catch(() => ({}))) as ImportRequestBody;
   const urls = Array.isArray(body.urls) ? body.urls.map(String) : [];
 

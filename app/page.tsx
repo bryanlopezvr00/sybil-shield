@@ -11,6 +11,7 @@ import { computeHandlePatternScores } from '../lib/scam';
 import type { AnalysisSettings, ActorScorecard, DetailedCluster, LogEntry, WaveResult } from '../lib/analyze';
 import type { ReviewDecision } from '../lib/reviewStore';
 import { deleteReview, getAllReviews, upsertReview } from '../lib/reviewStore';
+import { addAuditEvent, clearAuditEvents, getRecentAuditEvents } from '../lib/auditStore';
 import Papa from 'papaparse';
 
 // Dynamically import CytoscapeComponent to avoid SSR issues
@@ -18,7 +19,7 @@ const CytoscapeComponent = dynamic(() => import('react-cytoscapejs'), { ssr: fal
 
 type CsvRow = Record<string, string | undefined>;
 
-type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'assistant' | 'graph' | 'results' | 'review' | 'evidence' | 'miniapp';
+type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'assistant' | 'graph' | 'results' | 'review' | 'evidence' | 'miniapp' | 'history';
 
 export default function Home() {
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
@@ -37,6 +38,13 @@ export default function Home() {
     churnActions: ['unfollow', 'unstar'],
     rapidActionsPerMinuteThreshold: 50,
     entropyMinTotalActions: 20,
+    burstWindowSeconds: 60,
+    burstMinCount: 20,
+    burstMinActors: 10,
+    velocityWindowSeconds: 10,
+    velocityMaxActionsInWindow: 20,
+    sessionGapMinutes: 5,
+    actionNgramSize: 3,
   });
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [fileUploaded, setFileUploaded] = useState(false);
@@ -100,6 +108,7 @@ export default function Home() {
   const analysisListenerRef = useRef<((ev: MessageEvent) => void) | null>(null);
   const [resultsPage, setResultsPage] = useState(1);
   const resultsPageSize = 50;
+  const [auditEvents, setAuditEvents] = useState<Array<{ id: string; type: string; at: string; summary: string }>>([]);
 
   type AssistantMessage = { role: 'user' | 'assistant'; text: string; at: string };
   const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>([]);
@@ -113,6 +122,19 @@ export default function Home() {
   useEffect(() => {
     const saved = window.localStorage.getItem('sybilShieldBaseRpcUrl');
     if (typeof saved === 'string' && saved.trim()) setBaseRpcUrl(saved);
+  }, []);
+
+  const refreshAudit = async () => {
+    try {
+      const items = await getRecentAuditEvents(500);
+      setAuditEvents(items.map((x) => ({ id: x.id, type: x.type, at: x.at, summary: x.summary })));
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    void refreshAudit();
   }, []);
 
   useEffect(() => {
@@ -307,18 +329,19 @@ export default function Home() {
       ]),
     );
 
-    return {
-      exportedAt: new Date().toISOString(),
-      settings,
-      insights,
-      reviews,
-      clusters,
-      waves,
-      scorecards: flaggedScorecards,
+	    return {
+	      exportedAt: new Date().toISOString(),
+	      settings,
+	      insights,
+	      auditTrail: auditEvents,
+	      reviews,
+	      clusters,
+	      waves,
+	      scorecards: flaggedScorecards,
       profileLinks,
       syntheticGroundTruth: syntheticGroundTruth ?? undefined,
     };
-  }, [clusters, insights, reviews, scorecards, flaggedScorecards, settings, syntheticGroundTruth, waves]);
+	  }, [auditEvents, clusters, insights, reviews, scorecards, flaggedScorecards, settings, syntheticGroundTruth, waves]);
 
   const evidenceJson = useMemo(() => JSON.stringify(evidenceObject, null, 2), [evidenceObject]);
   const evidenceSummary = useMemo(() => {
@@ -720,6 +743,12 @@ export default function Home() {
     setSourceError(null);
     setSourceStatus('Analyzing…');
     setResultsPage(1);
+    void addAuditEvent({
+      type: 'analysis_run',
+      at: new Date().toISOString(),
+      summary: `Analysis run: ${data.length.toLocaleString()} events, threshold ${settings.threshold.toFixed(2)}`,
+      meta: { count: data.length, settings },
+    }).then(refreshAudit);
 
     type WorkerProgress = { type: 'progress'; requestId: string; stage: string; pct: number };
     type WorkerResult = {
@@ -804,6 +833,7 @@ export default function Home() {
       const json = (await res.json()) as { logs?: LogEntry[]; error?: string };
       if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
       appendLogs(json.logs || [], `GitHub ${repo}`);
+      void addAuditEvent({ type: 'fetch_source', at: new Date().toISOString(), summary: `Fetched GitHub stargazers: ${repo}` }).then(refreshAudit);
     } catch (e) {
       setSourceStatus(null);
       setSourceError(e instanceof Error ? e.message : 'Failed to fetch GitHub data');
@@ -820,6 +850,7 @@ export default function Home() {
       const json = (await res.json()) as { logs?: LogEntry[]; error?: string; hint?: string };
       if (!res.ok) throw new Error([json.error, json.hint].filter(Boolean).join(' — ') || `Request failed (${res.status})`);
       appendLogs(json.logs || [], label);
+      void addAuditEvent({ type: 'fetch_source', at: new Date().toISOString(), summary: `Fetched source: ${label}` }).then(refreshAudit);
     } catch (e) {
       setSourceStatus(null);
       setSourceError(e instanceof Error ? e.message : `Failed to fetch ${label}`);
@@ -844,6 +875,7 @@ export default function Home() {
       const json = (await res.json()) as { logs?: LogEntry[]; error?: string; results?: { ok: boolean; count?: number }[] };
       if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
       appendLogs(json.logs || [], `Imported URLs (${urls.length})`);
+      void addAuditEvent({ type: 'import_urls', at: new Date().toISOString(), summary: `Imported URLs: ${urls.length} url(s)` }).then(refreshAudit);
     } catch (e) {
       setSourceStatus(null);
       setSourceError(e instanceof Error ? e.message : 'Failed to import URLs');
@@ -879,6 +911,7 @@ export default function Home() {
       setScanFoundDataFiles(json.dataFiles || []);
       setScanDetails(json.pages || []);
       setSourceStatus(`Scan complete: found ${(json.dataFiles || []).length} CSV/JSON file link(s)`);
+      void addAuditEvent({ type: 'scan_profile_links', at: new Date().toISOString(), summary: `Scanned profile links: ${urls.length} url(s)` }).then(refreshAudit);
     } catch (e) {
       setSourceStatus(null);
       setSourceError(e instanceof Error ? e.message : 'Failed to scan profile links');
@@ -951,6 +984,7 @@ export default function Home() {
 
       setSourceStatus(`Profile scan complete: ${profiles.length} scanned`);
       setActiveTab('analysis');
+      void addAuditEvent({ type: 'scan_profile', at: new Date().toISOString(), summary: `Profile anomaly scan: ${profiles.length} profile(s)` }).then(refreshAudit);
     } catch (e) {
       setSourceStatus(null);
       setSourceError(e instanceof Error ? e.message : 'Failed to scan profiles');
@@ -1033,6 +1067,11 @@ export default function Home() {
     a.href = url;
     a.download = 'evidence-pack.json';
     a.click();
+    void addAuditEvent({
+      type: 'export_evidence',
+      at: new Date().toISOString(),
+      summary: `Exported evidence pack (${flaggedScorecards.length.toLocaleString()} flagged)`,
+    }).then(refreshAudit);
   };
 
   return (
@@ -1058,6 +1097,7 @@ export default function Home() {
               <TabButton tab="review" label="Review" />
               <TabButton tab="evidence" label="Evidence" />
               <TabButton tab="miniapp" label="Mini-App" />
+              <TabButton tab="history" label="History" />
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -1804,17 +1844,24 @@ export default function Home() {
               <div className="flex flex-wrap gap-2 mb-3">
                 <button
                   onClick={() =>
-                    setSettings((s) => ({
-                      ...s,
-                      timeBinMinutes: 1,
-                      waveMinCount: 50,
-                      waveMinActors: 10,
-                      rapidActionsPerMinuteThreshold: 50,
-                      entropyMinTotalActions: 20,
-                      positiveActions: Array.from(
-                        new Set([
-                          ...s.positiveActions,
-                          'tap',
+	                    setSettings((s) => ({
+	                      ...s,
+	                      timeBinMinutes: 1,
+	                      waveMinCount: 50,
+	                      waveMinActors: 10,
+	                      rapidActionsPerMinuteThreshold: 50,
+	                      entropyMinTotalActions: 20,
+	                      burstWindowSeconds: 60,
+	                      burstMinCount: 50,
+	                      burstMinActors: 10,
+	                      velocityWindowSeconds: 10,
+	                      velocityMaxActionsInWindow: 25,
+	                      sessionGapMinutes: 5,
+	                      actionNgramSize: 3,
+	                      positiveActions: Array.from(
+	                        new Set([
+	                          ...s.positiveActions,
+	                          'tap',
                           'claim',
                           'reward',
                           'mint',
@@ -1916,6 +1963,103 @@ export default function Home() {
                     className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                   />
                 </label>
+                <div className="md:col-span-2">
+                  <details className="border border-slate-800 bg-black/30 rounded-lg p-3">
+                    <summary className="cursor-pointer text-sm text-slate-200">Advanced detection settings</summary>
+                    <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <label className="text-sm text-slate-200 block">
+                        Burst window (seconds)
+                        <input
+                          type="number"
+                          min={10}
+                          step={10}
+                          value={settings.burstWindowSeconds}
+                          onChange={(e) => setSettings((s) => ({ ...s, burstWindowSeconds: Math.max(10, Number.parseInt(e.target.value || '60', 10) || 60) }))}
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                      <label className="text-sm text-slate-200 block">
+                        Burst min count
+                        <input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={settings.burstMinCount}
+                          onChange={(e) => setSettings((s) => ({ ...s, burstMinCount: Math.max(1, Number.parseInt(e.target.value || '20', 10) || 20) }))}
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                      <label className="text-sm text-slate-200 block">
+                        Burst min actors
+                        <input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={settings.burstMinActors}
+                          onChange={(e) => setSettings((s) => ({ ...s, burstMinActors: Math.max(1, Number.parseInt(e.target.value || '10', 10) || 10) }))}
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                      <label className="text-sm text-slate-200 block">
+                        Velocity window (seconds)
+                        <input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={settings.velocityWindowSeconds}
+                          onChange={(e) =>
+                            setSettings((s) => ({ ...s, velocityWindowSeconds: Math.max(1, Number.parseInt(e.target.value || '10', 10) || 10) }))
+                          }
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                      <label className="text-sm text-slate-200 block">
+                        Velocity max actions/window
+                        <input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={settings.velocityMaxActionsInWindow}
+                          onChange={(e) =>
+                            setSettings((s) => ({
+                              ...s,
+                              velocityMaxActionsInWindow: Math.max(1, Number.parseInt(e.target.value || '20', 10) || 20),
+                            }))
+                          }
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                      <label className="text-sm text-slate-200 block">
+                        Session gap (minutes)
+                        <input
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={settings.sessionGapMinutes}
+                          onChange={(e) => setSettings((s) => ({ ...s, sessionGapMinutes: Math.max(1, Number.parseInt(e.target.value || '5', 10) || 5) }))}
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                      <label className="text-sm text-slate-200 block">
+                        Action n-gram size
+                        <input
+                          type="number"
+                          min={2}
+                          max={5}
+                          step={1}
+                          value={settings.actionNgramSize}
+                          onChange={(e) =>
+                            setSettings((s) => ({ ...s, actionNgramSize: Math.min(5, Math.max(2, Number.parseInt(e.target.value || '3', 10) || 3)) }))
+                          }
+                          className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-2 text-xs text-slate-500">
+                      Tip: burst/velocity/sequences help detect bots and coordinated mini-app farms even when they avoid fixed time bins.
+                    </div>
+                  </details>
+                </div>
                 <label className="text-sm text-slate-200 block md:col-span-2">
                   Positive actions (graph edges)
                   <input
@@ -2103,14 +2247,20 @@ export default function Home() {
               </ul>
             </Card>
 
-            <Card title="Waves" subtitle="Bursts in fixed time bins">
+            <Card title="Waves" subtitle="Fixed bins + sliding-window bursts">
               <ul className="text-sm text-slate-200 list-disc pl-4 space-y-1">
                 {waves.length === 0 && <li className="list-none text-slate-500">No waves yet.</li>}
-                {waves.map((w, i) => (
+                {waves
+                  .slice()
+                  .sort((a, b) => b.zScore - a.zScore)
+                  .slice(0, 80)
+                  .map((w, i) => (
                   <li key={i}>
-                    {w.windowStart}: {w.action} on {w.target} · {w.actors.length} actors · z {w.zScore.toFixed(2)}
+                    {w.windowStart}: {w.action} on {w.target} · {w.actors.length} actors · z {w.zScore.toFixed(2)}{' '}
+                    <span className="text-slate-500">({w.method || 'bin'})</span>
                   </li>
                 ))}
+                {waves.length > 80 && <li className="list-none text-xs text-slate-500">Showing top 80 waves by z-score.</li>}
               </ul>
             </Card>
 
@@ -2167,8 +2317,16 @@ export default function Home() {
                           Score <span className="font-semibold">{s.sybilScore.toFixed(2)}</span>
                         </div>
                       </div>
-                      <div className="mt-1 text-xs text-slate-400">
-                        Churn {s.churnScore} · Coord {s.coordinationScore.toFixed(2)} · Burst {s.burstRate.toFixed(2)} · Rapid {s.maxActionsPerMinute}/min · Ent {s.targetEntropy.toFixed(2)} · Reciprocity {s.reciprocalRate.toFixed(2)} · Bio {s.bioSimilarityScore.toFixed(2)} · Handle {s.handlePatternScore.toFixed(2)} · Phish {s.phishingLinkScore.toFixed(2)} · PR {s.pagerank.toFixed(4)} · Betw {s.betweenness.toFixed(2)} · New {s.newAccountScore}
+                      <div className="mt-1 text-xs text-slate-400 space-y-0.5">
+                        <div>
+                          Core: churn {s.churnScore} · coord {s.coordinationScore.toFixed(2)} · burst {s.burstRate.toFixed(2)} · diversity {s.lowDiversityScore.toFixed(2)} · cluster {s.clusterIsolationScore.toFixed(2)}
+                        </div>
+                        <div>
+                          Mini-app: rapid {s.maxActionsPerMinute}/min · velocity {s.maxActionsPerVelocityWindow} in {settings.velocityWindowSeconds}s · seq {s.actionSequenceRepeatScore.toFixed(2)} · sessions {s.sessionCount} · hours {s.activeHours}
+                        </div>
+                        <div>
+                          Profile/graph: links {s.links.length} · bio {s.bioSimilarityScore.toFixed(2)} · handle {s.handlePatternScore.toFixed(2)} · phish {s.phishingLinkScore.toFixed(2)} · PR {s.pagerank.toFixed(4)} · betw {s.betweenness.toFixed(2)}
+                        </div>
                       </div>
                       {s.reasons.length > 0 && (
                         <div className="mt-2 text-xs text-slate-200">
@@ -2242,15 +2400,15 @@ export default function Home() {
 
         {activeTab === 'miniapp' && (
           <div className="space-y-6">
-            <Card title="Mini-App Protection" subtitle="Enhanced detection for mini-app Sybil attacks (rapid interactions, wallet clusters, cross-app linking)">
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
-                  <h3 className="text-sm font-semibold text-slate-100">Shared Wallets</h3>
-                  <p className="text-xs text-slate-300 mt-1">Actors sharing wallet addresses</p>
-                  <div className="mt-2 text-lg font-bold text-slate-100">
-                    {scorecards.filter(s => s.sharedWallets.length > 0).length}
-                  </div>
-                </div>
+	            <Card title="Mini-App Protection" subtitle="Enhanced detection for mini-app Sybil attacks (rapid interactions, wallet clusters, cross-app linking)">
+	              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+	                  <h3 className="text-sm font-semibold text-slate-100">Shared Funders</h3>
+	                  <p className="text-xs text-slate-300 mt-1">Wallets funded by the same source</p>
+	                  <div className="mt-2 text-lg font-bold text-slate-100">
+	                    {scorecards.filter(s => s.sharedWallets.length > 0).length}
+	                  </div>
+	                </div>
                 <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
                   <h3 className="text-sm font-semibold text-slate-100">Cross-App Activity</h3>
                   <p className="text-xs text-slate-300 mt-1">Actors active on multiple platforms</p>
@@ -2272,26 +2430,58 @@ export default function Home() {
                     {scorecards.filter(s => s.fraudTxScore > 0.5).length}
                   </div>
                 </div>
-                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
-                  <h3 className="text-sm font-semibold text-slate-100">Rapid Interactions</h3>
-                  <p className="text-xs text-slate-300 mt-1">High actions per minute</p>
-                  <div className="mt-2 text-lg font-bold text-slate-100">
-                    {scorecards.filter(s => s.maxActionsPerMinute > settings.rapidActionsPerMinuteThreshold).length}
-                  </div>
-                </div>
-                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
-                  <h3 className="text-sm font-semibold text-slate-100">Low Target Entropy</h3>
-                  <p className="text-xs text-slate-300 mt-1">Focused on few targets</p>
-                  <div className="mt-2 text-lg font-bold text-slate-100">
-                    {scorecards.filter(s => s.lowEntropyScore > 0.7).length}
-                  </div>
-                </div>
-              </div>
-            </Card>
+	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+	                  <h3 className="text-sm font-semibold text-slate-100">Rapid Interactions</h3>
+	                  <p className="text-xs text-slate-300 mt-1">High actions per minute</p>
+	                  <div className="mt-2 text-lg font-bold text-slate-100">
+	                    {scorecards.filter(s => s.maxActionsPerMinute > settings.rapidActionsPerMinuteThreshold).length}
+	                  </div>
+	                </div>
+	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+	                  <h3 className="text-sm font-semibold text-slate-100">High Velocity</h3>
+	                  <p className="text-xs text-slate-300 mt-1">Many actions in a few seconds</p>
+	                  <div className="mt-2 text-lg font-bold text-slate-100">
+	                    {scorecards.filter(s => s.velocityScore > 0.7).length}
+	                  </div>
+	                </div>
+	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+	                  <h3 className="text-sm font-semibold text-slate-100">Script Sequences</h3>
+	                  <p className="text-xs text-slate-300 mt-1">Repeated action n-grams</p>
+	                  <div className="mt-2 text-lg font-bold text-slate-100">
+	                    {scorecards.filter(s => s.actionSequenceRepeatScore > 0.7).length}
+	                  </div>
+	                </div>
+	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+	                  <h3 className="text-sm font-semibold text-slate-100">Circadian Anomalies</h3>
+	                  <p className="text-xs text-slate-300 mt-1">Unnatural active-hour patterns</p>
+	                  <div className="mt-2 text-lg font-bold text-slate-100">
+	                    {scorecards.filter(s => s.circadianScore >= 0.8).length}
+	                  </div>
+	                </div>
+	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+	                  <h3 className="text-sm font-semibold text-slate-100">Low Target Entropy</h3>
+	                  <p className="text-xs text-slate-300 mt-1">Focused on few targets</p>
+	                  <div className="mt-2 text-lg font-bold text-slate-100">
+	                    {scorecards.filter(s => s.lowEntropyScore > 0.7).length}
+	                  </div>
+	                </div>
+	              </div>
+	            </Card>
             <Card title="Top Mini-App Risks" subtitle="Actors with highest mini-app specific scores">
               <ul className="space-y-2">
                 {scorecards
-                  .filter(s => s.sharedWallets.length > 0 || s.crossAppPlatforms.length > 1 || s.sessionCount > 5 || s.fraudTxScore > 0.5 || s.maxActionsPerMinute > settings.rapidActionsPerMinuteThreshold || s.lowEntropyScore > 0.7)
+                  .filter(
+                    (s) =>
+                      s.sharedWallets.length > 0 ||
+                      s.crossAppPlatforms.length > 1 ||
+                      s.sessionCount > 5 ||
+                      s.fraudTxScore > 0.5 ||
+                      s.maxActionsPerMinute > settings.rapidActionsPerMinuteThreshold ||
+                      s.velocityScore > 0.7 ||
+                      s.actionSequenceRepeatScore > 0.7 ||
+                      s.circadianScore >= 0.8 ||
+                      s.lowEntropyScore > 0.7,
+                  )
                   .sort((a, b) => b.sybilScore - a.sybilScore)
                   .slice(0, 10)
                   .map((s) => (
@@ -2405,6 +2595,76 @@ export default function Home() {
                 </div>
               ))}
               {flaggedScorecards.length > 100 && <div className="text-xs text-slate-500">Showing first 100 flagged actors.</div>}
+            </div>
+          </Card>
+        )}
+
+        {activeTab === 'history' && (
+          <Card title="History" subtitle="Local audit trail (stored in IndexedDB)">
+            <div className="flex flex-wrap gap-2">
+              <button onClick={refreshAudit} className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 hover:bg-slate-900/50">
+                Refresh
+              </button>
+              <button
+                onClick={async () => {
+                  await clearAuditEvents();
+                  await refreshAudit();
+                  setSourceStatus('Cleared audit history');
+                }}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 hover:bg-slate-900/50"
+              >
+                Clear history
+              </button>
+              <button
+                onClick={() => {
+                  const blob = new Blob([JSON.stringify(auditEvents, null, 2)], { type: 'application/json' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = 'audit-history.json';
+                  a.click();
+                }}
+                disabled={auditEvents.length === 0}
+                className="px-3 py-2 rounded-md bg-slate-100 text-slate-950 text-sm font-semibold disabled:opacity-50"
+              >
+                Download JSON
+              </button>
+              <button
+                onClick={() => {
+                  const lines = ['at,type,summary'];
+                  auditEvents.forEach((e) => {
+                    const esc = (v: string) => `"${v.replaceAll('"', '""')}"`;
+                    lines.push([esc(e.at), esc(e.type), esc(e.summary)].join(','));
+                  });
+                  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = 'audit-history.csv';
+                  a.click();
+                }}
+                disabled={auditEvents.length === 0}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 disabled:opacity-50"
+              >
+                Download CSV
+              </button>
+            </div>
+
+            <div className="mt-4 border border-slate-800 bg-black/40 rounded-lg p-3 max-h-[720px] overflow-y-auto">
+              {auditEvents.length === 0 ? (
+                <div className="text-sm text-slate-500">No history yet. Run analysis, imports, scans, or exports to populate.</div>
+              ) : (
+                <ul className="space-y-2">
+                  {auditEvents.map((e) => (
+                    <li key={e.id} className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
+                      <div className="text-xs text-slate-500">
+                        {e.at} · {e.type}
+                      </div>
+                      <div className="text-sm text-slate-200 mt-1">{e.summary}</div>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </Card>
         )}
