@@ -7,7 +7,7 @@
 
 ## Demo Video
 
-![Sybil Shield Demo](promo.gif)
+<img src="promo.gif" width="800" alt="Sybil Shield Demo">
 
 Full video available for download: [promo.mp4](promo.mp4)
 
