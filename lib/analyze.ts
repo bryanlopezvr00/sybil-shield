@@ -103,6 +103,17 @@ export type ActorScorecard = {
   actionSequenceRepeatScore: number;
   topActionNgram: string;
   topActionNgramCount: number;
+  botnetScore: number;
+  botnetGroupSize: number;
+  botnetSignature: string;
+  cadenceScore: number;
+  cadenceGroupSize: number;
+  medianActionGapSeconds: number;
+  amountFingerprintScore: number;
+  roundAmountRate: number;
+  topAmountBucket: string;
+  topAmountBucketCount: number;
+  sharedAmountBucketActors: number;
   avgSessionMinutes: number;
   avgSessionGapMinutes: number;
   maxSessionGapMinutes: number;
@@ -465,6 +476,9 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   );
   const circadianByActor = computeCircadianByActor(logs);
   const ngramByActor = computeActionNgramByActor(logs, Math.min(Math.max(2, settings.actionNgramSize), 5));
+  const botnetByActor = computeBotnetPatternByActor(ngramByActor);
+  const cadenceByActor = computeCadenceByActor(logs);
+  const amountFpByActor = detectAmountFingerprints(logs);
 
   // Cross-actor similarity (same targets == coordinated ops / multi-account)
   const maxJaccardByActor = new Map<string, { score: number; peer: string }>();
@@ -646,6 +660,15 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     const velocity = velocityByActor.get(stats.actor) ?? { maxInWindow: 0, maxPerSecond: 0, velocityScore: 0 };
     const circadian = circadianByActor.get(stats.actor) ?? { hourEntropy: 0, activeHours: 0, circadianScore: 0 };
     const ngram = ngramByActor.get(stats.actor) ?? { repeatScore: 0, topNgram: '', topCount: 0 };
+    const botnet = botnetByActor.get(stats.actor) ?? { botnetScore: 0, groupSize: 0, signature: '' };
+    const cadence = cadenceByActor.get(stats.actor) ?? { cadenceScore: 0, groupSize: 0, medianGapSeconds: 0 };
+    const amountFp = amountFpByActor.get(stats.actor) ?? {
+      amountFingerprintScore: 0,
+      roundAmountRate: 0,
+      topAmountBucket: '',
+      topAmountBucketCount: 0,
+      sharedAmountBucketActors: 0,
+    };
 
     const session = sessionMetrics.get(stats.actor) ?? {
       sessionCount: 0,
@@ -672,6 +695,9 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
         0.05 * (stats.totalActions >= settings.entropyMinTotalActions ? lowEntropyScore : 0) +
         0.05 * velocity.velocityScore +
         0.03 * ngram.repeatScore +
+        0.04 * botnet.botnetScore +
+        0.03 * cadence.cadenceScore +
+        0.04 * amountFp.amountFingerprintScore +
         0.03 * circadian.circadianScore +
         0.05 * (jacc.score >= 0.85 && stats.uniqueTargets.size >= 3 ? Math.min((jacc.score - 0.85) / 0.15, 1) : 0) +
         seedInfluence * seedProximityScore +
@@ -701,6 +727,11 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     if (maxApm >= settings.rapidActionsPerMinuteThreshold) reasons.push(`Rapid actions (${maxApm}/min)`);
     if (velocity.velocityScore >= 0.7) reasons.push(`High velocity (${velocity.maxInWindow} in ${Math.max(1, settings.velocityWindowSeconds)}s)`);
     if (ngram.repeatScore >= 0.7 && ngram.topNgram) reasons.push(`Script-like sequence (${ngram.topNgram})`);
+    if (botnet.botnetScore >= 0.5 && botnet.signature) reasons.push(`Botnet-like shared script (${botnet.signature}) across ${botnet.groupSize} actors`);
+    if (cadence.cadenceScore >= 0.6 && cadence.groupSize >= 5)
+      reasons.push(`Synchronized cadence (median gap ~${Math.round(cadence.medianGapSeconds)}s) across ${cadence.groupSize} actors`);
+    if (amountFp.amountFingerprintScore >= 0.6 && amountFp.topAmountBucket)
+      reasons.push(`Shared amount fingerprint (${amountFp.topAmountBucket}) across ${amountFp.sharedAmountBucketActors} actors`);
     if (circadian.circadianScore >= 0.8) reasons.push(`Unnatural circadian pattern (active hours ${circadian.activeHours})`);
     if (jacc.score >= 0.85 && stats.uniqueTargets.size >= 3 && jacc.peer) reasons.push(`Very similar targets to ${jacc.peer} (Jaccard ${jacc.score.toFixed(2)})`);
     if (seedInfluence > 0 && seedProximityScore >= 0.5) reasons.push(`Near confirmed sybil(s) (seed proximity ${seedProximityScore.toFixed(2)})`);
@@ -746,6 +777,17 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       actionSequenceRepeatScore: ngram.repeatScore,
       topActionNgram: ngram.topNgram,
       topActionNgramCount: ngram.topCount,
+      botnetScore: botnet.botnetScore,
+      botnetGroupSize: botnet.groupSize,
+      botnetSignature: botnet.signature,
+      cadenceScore: cadence.cadenceScore,
+      cadenceGroupSize: cadence.groupSize,
+      medianActionGapSeconds: cadence.medianGapSeconds,
+      amountFingerprintScore: amountFp.amountFingerprintScore,
+      roundAmountRate: amountFp.roundAmountRate,
+      topAmountBucket: amountFp.topAmountBucket,
+      topAmountBucketCount: amountFp.topAmountBucketCount,
+      sharedAmountBucketActors: amountFp.sharedAmountBucketActors,
       avgSessionMinutes: session.avgSessionMinutes,
       avgSessionGapMinutes: session.avgGapMinutes,
       maxSessionGapMinutes: session.maxGapMinutes,
@@ -1002,6 +1044,69 @@ function computeActionNgramByActor(logs: LogEntry[], n: number): Map<string, { r
   return out;
 }
 
+function computeBotnetPatternByActor(
+  ngramByActor: Map<string, { repeatScore: number; topNgram: string; topCount: number }>,
+): Map<string, { botnetScore: number; groupSize: number; signature: string }> {
+  const bySignature = new Map<string, string[]>();
+  ngramByActor.forEach((ng, actor) => {
+    if (!ng.topNgram) return;
+    if (ng.repeatScore < 0.7) return;
+    if (ng.topCount < 5) return;
+    if (!bySignature.has(ng.topNgram)) bySignature.set(ng.topNgram, []);
+    bySignature.get(ng.topNgram)!.push(actor);
+  });
+
+  const out = new Map<string, { botnetScore: number; groupSize: number; signature: string }>();
+  bySignature.forEach((actors, signature) => {
+    if (actors.length < 3) return;
+    const score = Math.min((actors.length - 2) / 8, 1);
+    for (const actor of actors) out.set(actor, { botnetScore: score, groupSize: actors.length, signature });
+  });
+  return out;
+}
+
+function computeCadenceByActor(logs: LogEntry[]): Map<string, { cadenceScore: number; groupSize: number; medianGapSeconds: number }> {
+  const actorTimes = new Map<string, number[]>();
+  logs.forEach((log) => {
+    const ts = new Date(log.timestamp).getTime();
+    if (!Number.isFinite(ts)) return;
+    if (!actorTimes.has(log.actor)) actorTimes.set(log.actor, []);
+    actorTimes.get(log.actor)!.push(ts);
+  });
+
+  const medianGapByActor = new Map<string, number>();
+  actorTimes.forEach((times, actor) => {
+    if (times.length < 12) return;
+    times.sort((a, b) => a - b);
+    const gaps: number[] = [];
+    for (let i = 1; i < times.length; i++) gaps.push(times[i] - times[i - 1]);
+    gaps.sort((a, b) => a - b);
+    const mid = Math.floor(gaps.length / 2);
+    const median = gaps.length % 2 === 0 ? (gaps[mid - 1] + gaps[mid]) / 2 : gaps[mid];
+    if (!Number.isFinite(median) || median <= 0) return;
+    medianGapByActor.set(actor, median / 1000);
+  });
+
+  // Group by a coarse bucket: nearest 5 seconds, capped to avoid huge keys.
+  const bucketToActors = new Map<string, string[]>();
+  medianGapByActor.forEach((gapS, actor) => {
+    const b = Math.min(60 * 60, Math.max(1, Math.round(gapS / 5) * 5));
+    const key = String(b);
+    if (!bucketToActors.has(key)) bucketToActors.set(key, []);
+    bucketToActors.get(key)!.push(actor);
+  });
+
+  const out = new Map<string, { cadenceScore: number; groupSize: number; medianGapSeconds: number }>();
+  bucketToActors.forEach((actors, bucket) => {
+    if (actors.length < 5) return;
+    const groupSize = actors.length;
+    const score = Math.min((groupSize - 4) / 12, 1);
+    const medianGapSeconds = Number.parseInt(bucket, 10) || 0;
+    for (const actor of actors) out.set(actor, { cadenceScore: score, groupSize, medianGapSeconds });
+  });
+  return out;
+}
+
 function detectWindowBursts(input: {
   logs: LogEntry[];
   windowMs: number;
@@ -1119,6 +1224,100 @@ export function detectFraudulentTransactions(logs: LogEntry[]): Map<string, numb
     fraudScores.set(actor, Math.min(score, 1));
   });
   return fraudScores;
+}
+
+export function detectAmountFingerprints(
+  logs: LogEntry[],
+): Map<
+  string,
+  {
+    amountFingerprintScore: number;
+    roundAmountRate: number;
+    topAmountBucket: string;
+    topAmountBucketCount: number;
+    sharedAmountBucketActors: number;
+  }
+> {
+  const perActor: Map<string, number[]> = new Map();
+  for (const log of logs) {
+    const amount = log.amount;
+    if (amount === undefined) continue;
+    if (!Number.isFinite(amount)) continue;
+    if (!perActor.has(log.actor)) perActor.set(log.actor, []);
+    perActor.get(log.actor)!.push(amount);
+  }
+
+  const bucket = (a: number): string => {
+    const rounded = Math.round(a * 1_000_000) / 1_000_000;
+    // Keep buckets stable for UI/evidence, but avoid huge strings.
+    return Number.isFinite(rounded) ? String(rounded) : '';
+  };
+
+  const isRoundish = (a: number): boolean => {
+    const abs = Math.abs(a);
+    if (abs === 0) return true;
+    // Round to 2 decimals / 3 decimals / integer.
+    const near = (step: number) => {
+      const v = abs / step;
+      return Math.abs(v - Math.round(v)) < 1e-9;
+    };
+    return near(1) || near(0.1) || near(0.01) || near(0.001);
+  };
+
+  const bucketActors = new Map<string, Set<string>>();
+  const topBucketByActor = new Map<string, { bucket: string; count: number; roundRate: number; score: number; sharedActors: number }>();
+
+  // First pass: per-actor bucket counts
+  perActor.forEach((amounts, actor) => {
+    const counts = new Map<string, number>();
+    let round = 0;
+    for (const a of amounts) {
+      const b = bucket(a);
+      if (!b) continue;
+      counts.set(b, (counts.get(b) || 0) + 1);
+      if (isRoundish(a)) round++;
+    }
+
+    let top = { bucket: '', count: 0 };
+    counts.forEach((c, b) => {
+      if (c > top.count) top = { bucket: b, count: c };
+    });
+
+    const roundRate = amounts.length > 0 ? round / amounts.length : 0;
+    const repeatRate = amounts.length > 0 ? top.count / amounts.length : 0;
+    // Shared actors will be populated after we build bucketActors.
+    topBucketByActor.set(actor, { bucket: top.bucket, count: top.count, roundRate, score: Math.min(repeatRate, 1), sharedActors: 0 });
+  });
+
+  // Build bucket -> actors map (using each actor's top bucket only to keep it sparse)
+  topBucketByActor.forEach((t, actor) => {
+    if (!t.bucket) return;
+    if (!bucketActors.has(t.bucket)) bucketActors.set(t.bucket, new Set());
+    bucketActors.get(t.bucket)!.add(actor);
+  });
+
+  // Final score combines (a) repeated amounts, (b) shared top amount across many actors, (c) roundish amount rate.
+  const out = new Map<
+    string,
+    { amountFingerprintScore: number; roundAmountRate: number; topAmountBucket: string; topAmountBucketCount: number; sharedAmountBucketActors: number }
+  >();
+
+  topBucketByActor.forEach((t, actor) => {
+    const sharedActors = t.bucket ? (bucketActors.get(t.bucket)?.size ?? 0) : 0;
+    const sharedScore = sharedActors >= 5 ? Math.min((sharedActors - 4) / 12, 1) : 0;
+    const repeatScore = Math.min(t.score, 1);
+    const roundScore = Math.min(t.roundRate / 0.8, 1) * 0.5;
+    const amountFingerprintScore = Math.min(Math.max(0.6 * sharedScore + 0.4 * repeatScore + roundScore, 0), 1);
+    out.set(actor, {
+      amountFingerprintScore,
+      roundAmountRate: t.roundRate,
+      topAmountBucket: t.bucket,
+      topAmountBucketCount: t.count,
+      sharedAmountBucketActors: sharedActors,
+    });
+  });
+
+  return out;
 }
 
 function computePageRank(nodes: string[], out: Map<string, string[]>, incoming: Map<string, string[]>): Map<string, number> {
